@@ -95,6 +95,10 @@ for k, v in {
 if "meeting_title_key" not in st.session_state:
     st.session_state["meeting_title_key"] = f"會議記錄 {datetime.now():%Y-%m-%d}"
 
+# 若上次 rerun 有待套用的檔名，在 sidebar 渲染前先更新 widget key
+if st.session_state.get("_pending_title"):
+    st.session_state["meeting_title_key"] = st.session_state.pop("_pending_title")
+
 # ── 從 localStorage 載入歷史記錄（每個 session 只做一次）────────────────────────
 if not st.session_state["_history_loaded"]:
     _raw = st_javascript('localStorage.getItem("meetTranscribeHistory")')
@@ -427,7 +431,7 @@ with st.sidebar:
         st.session_state.meeting_info      = {}
         st.session_state.current_record_id = None
         st.session_state["_last_uploaded"] = ""
-        st.session_state["meeting_title_key"] = f"會議記錄 {datetime.now():%Y-%m-%d}"
+        st.session_state["_pending_title"] = f"會議記錄 {datetime.now():%Y-%m-%d}"
         st.rerun()
 
 # ── Hero ───────────────────────────────────────────────────────────────────────
@@ -451,8 +455,8 @@ with tab_up:
     )
     if uploaded:
         if st.session_state["_last_uploaded"] != uploaded.name:
-            st.session_state["_last_uploaded"]    = uploaded.name
-            st.session_state["meeting_title_key"] = Path(uploaded.name).stem
+            st.session_state["_last_uploaded"] = uploaded.name
+            st.session_state["_pending_title"] = Path(uploaded.name).stem
             st.rerun()
         st.audio(uploaded)
         col_info, col_btn = st.columns([5, 1])
