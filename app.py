@@ -78,11 +78,12 @@ st.markdown("""
 
 # ── Session state ──────────────────────────────────────────────────────────────
 for k, v in {
-    "transcript":   [],
-    "analysis":     None,
-    "meeting_info": {},
-    "history":      [],
-    "hist_idx":     None,
+    "transcript":        [],
+    "analysis":          None,
+    "meeting_info":      {},
+    "history":           [],
+    "hist_idx":          None,
+    "current_record_id": None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -92,6 +93,11 @@ LANG_MAP      = {"自動偵測": None, "中文 (zh)": "zh", "英文 (en)": "en"}
 WHISPER_MAX   = 24 * 1_048_576          # 24 MB
 WHISPER_MODEL = "whisper-large-v3"
 CHAT_MODEL    = "llama-3.3-70b-versatile"
+
+# Groq 免費方案 TPM 上限 ~12,000 tokens；
+# prompt 固定部分約 500 tokens，max_tokens=2048，故逐字稿最多保留 ~9,000 tokens。
+# 中文約 1.5 chars/token → 安全字元上限取 12,000 chars
+MAX_TRANSCRIPT_CHARS = 12_000
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def secs_hms(s: float) -> str:
@@ -208,7 +214,15 @@ def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> di
     has_zh   = any("\u4e00" <= c <= "\u9fff" for e in transcript for c in e["text"])
     out_lang = "繁體中文" if has_zh else "English"
 
-    prompt = f"""你是一個專業的會議記錄分析師。請分析以下會議逐字稿，並以 {out_lang} 輸出結構化的分析結果。
+    # ── 超長逐字稿截斷（保留前 2/3、後 1/3，避免 TPM 超限）──────────────────
+    truncated = False
+    if len(txt) > MAX_TRANSCRIPT_CHARS:
+        keep_head = int(MAX_TRANSCRIPT_CHARS * 0.67)
+        keep_tail = MAX_TRANSCRIPT_CHARS - keep_head
+        txt = txt[:keep_head] + f"\n\n… [逐字稿過長，中間部分已略去] …\n\n" + txt[-keep_tail:]
+        truncated = True
+
+    prompt = f"""你是一個專業的會議記錄分析師。請分析以下會議逐字稿，並以 {out_lang} 輸出結構化的分析結果。{"（注意：逐字稿因過長已截取首尾，請根據現有內容盡力分析。）" if truncated else ""}
 
 會議資訊：
 - 標題：{meeting_info.get("title", "未命名會議")}
@@ -246,7 +260,7 @@ def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> di
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=4096,
+        max_tokens=2048,
         temperature=0.3,
     )
     text = resp.choices[0].message.content.strip()
@@ -257,7 +271,19 @@ def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> di
     return json.loads(text)
 
 
-def save_to_history(transcript, analysis, meeting_info):
+def save_to_history(transcript, analysis, meeting_info, record_id=None) -> str:
+    """新增或更新歷史記錄，回傳 record id。"""
+    # 若已有 id，直接更新現有記錄
+    if record_id:
+        for r in st.session_state.history:
+            if r["id"] == record_id:
+                r["transcript"]   = transcript
+                r["analysis"]     = analysis
+                r["meeting_info"] = meeting_info
+                r["participants"] = meeting_info.get("participants", [])
+                return record_id
+
+    # 新增記錄
     record = {
         "id":           datetime.now().strftime("%Y%m%d_%H%M%S"),
         "title":        meeting_info.get("title", "未命名會議"),
@@ -267,9 +293,8 @@ def save_to_history(transcript, analysis, meeting_info):
         "analysis":     analysis,
         "meeting_info": meeting_info,
     }
-    key = (record["title"], record["date"])
-    if not any((r["title"], r["date"]) == key for r in st.session_state.history):
-        st.session_state.history.insert(0, record)
+    st.session_state.history.insert(0, record)
+    return record["id"]
 
 
 def plain_text(data: dict, info: dict, transcript: list) -> str:
@@ -406,14 +431,21 @@ with tab_up:
                 with st.spinner("Groq Whisper 轉錄中，請稍候…"):
                     try:
                         segs = transcribe_audio(uploaded.read(), uploaded.name, groq_key, LANG_MAP[language])
-                        st.session_state.transcript   = [
+                        entries = [
                             {"speaker": speaker_names[0], "text": s["text"],
                              "displayTime": secs_hms(s["start"]), "rawTime": int(s["start"] * 1000)}
                             for s in segs
                         ]
-                        st.session_state.analysis     = None
-                        st.session_state.meeting_info = {}
-                        st.success(f"轉錄完成！共 {len(segs)} 段")
+                        info = {
+                            "title":        meeting_title,
+                            "date":         datetime.now().strftime("%Y/%m/%d %H:%M"),
+                            "participants": [speaker_names[0]],
+                        }
+                        st.session_state.transcript        = entries
+                        st.session_state.analysis          = None
+                        st.session_state.meeting_info      = info
+                        st.session_state.current_record_id = save_to_history(entries, None, info)
+                        st.success(f"轉錄完成！共 {len(segs)} 段，已自動儲存至歷史記錄。")
                         st.rerun()
                     except Exception as e:
                         st.error(f"轉錄失敗：{e}")
@@ -434,14 +466,21 @@ with tab_rec:
                     with st.spinner("Groq Whisper 轉錄中…"):
                         try:
                             segs = transcribe_audio(audio_val.read(), "recording.wav", groq_key, LANG_MAP[language])
-                            st.session_state.transcript   = [
+                            entries = [
                                 {"speaker": speaker_names[0], "text": s["text"],
                                  "displayTime": secs_hms(s["start"]), "rawTime": int(s["start"] * 1000)}
                                 for s in segs
                             ]
-                            st.session_state.analysis     = None
-                            st.session_state.meeting_info = {}
-                            st.success("轉錄完成！")
+                            info = {
+                                "title":        meeting_title,
+                                "date":         datetime.now().strftime("%Y/%m/%d %H:%M"),
+                                "participants": [speaker_names[0]],
+                            }
+                            st.session_state.transcript        = entries
+                            st.session_state.analysis          = None
+                            st.session_state.meeting_info      = info
+                            st.session_state.current_record_id = save_to_history(entries, None, info)
+                            st.success("轉錄完成！已自動儲存至歷史記錄。")
                             st.rerun()
                         except Exception as e:
                             st.error(f"錯誤：{e}")
@@ -475,9 +514,10 @@ with tab_hist:
         with col_list:
             for i, rec in enumerate(history):
                 is_active = (st.session_state.hist_idx == i)
+                tag = "" if rec.get("analysis") else ' <span style="font-size:.75rem;color:#9ca3af;">（逐字稿）</span>'
                 st.markdown(
                     f'<div class="hist-card {"active" if is_active else ""}">'
-                    f'<div class="hist-title">{rec["title"]}</div>'
+                    f'<div class="hist-title">{rec["title"]}{tag}</div>'
                     f'<div class="hist-meta">{rec["date"]}</div>'
                     f'<div class="hist-meta">{" · ".join(rec.get("participants", []))}</div></div>',
                     unsafe_allow_html=True,
@@ -488,7 +528,25 @@ with tab_hist:
         with col_detail:
             idx = st.session_state.hist_idx
             if idx is not None and idx < len(history):
-                render_results(history[idx]["analysis"], history[idx]["meeting_info"], history[idx]["transcript"])
+                rec = history[idx]
+                if rec["analysis"] is None:
+                    st.info("📝 此記錄尚未進行 AI 分析，僅顯示逐字稿。")
+                    info = rec["meeting_info"]
+                    st.markdown(f"**{info.get('title','')}**　{info.get('date','')}")
+                    fname = info.get("title", "transcript").replace(" ", "_")
+                    st.download_button(
+                        "⬇ 下載逐字稿",
+                        "\n".join(f"{e['speaker']}: {e['text']}" for e in rec["transcript"]),
+                        f"{fname}.txt",
+                    )
+                    for e in rec["transcript"]:
+                        st.markdown(
+                            f'<div class="tr-row"><span class="tr-spk">{e["speaker"]}:</span>'
+                            f'<span>{e["text"]}</span></div>',
+                            unsafe_allow_html=True,
+                        )
+                else:
+                    render_results(rec["analysis"], rec["meeting_info"], rec["transcript"])
             else:
                 st.info("← 點擊左側紀錄查看內容")
 
@@ -528,6 +586,12 @@ if st.session_state.transcript:
         if not groq_key:
             st.error("請輸入 Groq API Key")
         else:
+            full_txt = "\n".join(e["text"] for e in st.session_state.transcript)
+            if len(full_txt) > MAX_TRANSCRIPT_CHARS:
+                st.warning(
+                    f"⚠️ 逐字稿共 {len(full_txt):,} 字元，超過 Groq 免費方案上限（{MAX_TRANSCRIPT_CHARS:,} 字元）。"
+                    " 系統將自動保留首尾最重要的片段進行分析。如需完整分析，請升級至 Groq Dev Tier。"
+                )
             with st.spinner("Llama 分析中，請稍候…"):
                 try:
                     info = {
@@ -536,9 +600,12 @@ if st.session_state.transcript:
                         "participants": list(dict.fromkeys(e["speaker"] for e in st.session_state.transcript)),
                     }
                     result = analyze_with_groq(st.session_state.transcript, info, groq_key)
-                    st.session_state.analysis     = result
-                    st.session_state.meeting_info = info
-                    save_to_history(st.session_state.transcript, result, info)
+                    st.session_state.analysis          = result
+                    st.session_state.meeting_info      = info
+                    st.session_state.current_record_id = save_to_history(
+                        st.session_state.transcript, result, info,
+                        st.session_state.current_record_id,
+                    )
                     st.rerun()
                 except Exception as e:
                     st.error(f"分析失敗：{e}")
