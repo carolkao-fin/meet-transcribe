@@ -84,9 +84,13 @@ for k, v in {
     "history":           [],
     "hist_idx":          None,
     "current_record_id": None,
+    "_last_uploaded":    "",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+if "meeting_title_key" not in st.session_state:
+    st.session_state["meeting_title_key"] = f"會議記錄 {datetime.now():%Y-%m-%d}"
 
 # ── 常數 ───────────────────────────────────────────────────────────────────────
 LANG_MAP      = {"自動偵測": None, "中文 (zh)": "zh", "英文 (en)": "en"}
@@ -381,7 +385,7 @@ with st.sidebar:
         st.caption("📌 [免費取得 Groq Key](https://console.groq.com) — 用 Google 帳號即可註冊")
 
     with st.expander("📋 會議資訊", expanded=True):
-        meeting_title = st.text_input("標題", value=f"會議記錄 {datetime.now():%Y-%m-%d}")
+        meeting_title = st.text_input("標題", key="meeting_title_key")
         language      = st.selectbox("語言", ["自動偵測", "中文 (zh)", "英文 (en)"])
 
     with st.expander("👤 發言者", expanded=True):
@@ -393,9 +397,12 @@ with st.sidebar:
 
     st.divider()
     if st.button("🗑 清除重來", use_container_width=True):
-        st.session_state.transcript   = []
-        st.session_state.analysis     = None
-        st.session_state.meeting_info = {}
+        st.session_state.transcript        = []
+        st.session_state.analysis          = None
+        st.session_state.meeting_info      = {}
+        st.session_state.current_record_id = None
+        st.session_state["_last_uploaded"] = ""
+        st.session_state["meeting_title_key"] = f"會議記錄 {datetime.now():%Y-%m-%d}"
         st.rerun()
 
 # ── Hero ───────────────────────────────────────────────────────────────────────
@@ -418,6 +425,10 @@ with tab_up:
         label_visibility="collapsed",
     )
     if uploaded:
+        if st.session_state["_last_uploaded"] != uploaded.name:
+            st.session_state["_last_uploaded"]    = uploaded.name
+            st.session_state["meeting_title_key"] = Path(uploaded.name).stem
+            st.rerun()
         st.audio(uploaded)
         col_info, col_btn = st.columns([5, 1])
         with col_info:
