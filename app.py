@@ -69,11 +69,27 @@ st.markdown("""
 .ai-who   { font-weight: 700; color: #138A8A; }
 .tr-row   { display:flex; gap:.75rem; padding:.28rem 0; font-size:.9rem; line-height:1.57; }
 .tr-spk   { font-weight:700; min-width:90px; flex-shrink:0; color:#1BA8A8; }
+.hist-card {
+    border: 1.5px solid #e5e7eb; border-radius: 10px;
+    padding: .75rem 1rem; margin-bottom: .5rem;
+    cursor: pointer; transition: all .15s;
+    background: white;
+}
+.hist-card:hover { border-color: #1BA8A8; background: #f0fcfc; }
+.hist-card.active { border-color: #1BA8A8; background: #e0f5f5; }
+.hist-title { font-weight: 700; font-size: .95rem; color: #1f2937; }
+.hist-meta  { font-size: .78rem; color: #9ca3af; margin-top: .2rem; }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Session state ──────────────────────────────────────────────────────────────
-for k, v in {"transcript": [], "analysis": None, "meeting_info": {}}.items():
+for k, v in {
+    "transcript":   [],
+    "analysis":     None,
+    "meeting_info": {},
+    "history":      [],      # [{id, title, date, transcript, analysis, meeting_info}]
+    "hist_idx":     None,    # 目前正在檢視的歷史項目 index
+}.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -257,6 +273,95 @@ def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> di
     return json.loads(text)
 
 
+def save_to_history(transcript: list, analysis: dict, meeting_info: dict) -> None:
+    """分析完成後自動存入 session 歷史清單（同標題+日期不重複）。"""
+    record = {
+        "id":           datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "title":        meeting_info.get("title", "未命名會議"),
+        "date":         meeting_info.get("date", ""),
+        "participants": meeting_info.get("participants", []),
+        "transcript":   transcript,
+        "analysis":     analysis,
+        "meeting_info": meeting_info,
+    }
+    # 以 (title, date) 去重
+    key = (record["title"], record["date"])
+    if not any((r["title"], r["date"]) == key for r in st.session_state.history):
+        st.session_state.history.insert(0, record)   # 最新的放最前面
+
+
+def render_results(data: dict, info: dict, transcript: list) -> None:
+    """渲染分析結果（會議摘要頁與歷史頁共用）。"""
+    participants = info.get("participants", [])
+    badges = " ".join(f'<span class="pbadge">[{p}]</span>' for p in participants)
+    st.markdown(
+        f'<div class="res-header">'
+        f'<h2>{info.get("title","會議記錄")}</h2>'
+        f'<div class="meta">🕐 {info.get("date","")} &nbsp;·&nbsp; 參與者：{badges}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    if data.get("summary"):
+        st.markdown('<div class="sec-title">📋 Meeting Summary</div>', unsafe_allow_html=True)
+        for sec in data["summary"]:
+            title = sec.get("title", "").replace("### ", "")
+            st.markdown(f'<div class="sum-h">### {title}</div>', unsafe_allow_html=True)
+            if sec.get("overview"):
+                st.markdown(f'<div class="sum-ov">{sec["overview"]}</div>', unsafe_allow_html=True)
+            for b in sec.get("bullets", []):
+                st.markdown(f'<div class="bullet">{b.lstrip("- ")}</div>', unsafe_allow_html=True)
+
+    if data.get("topics"):
+        st.markdown('<div class="sec-title">🏷 Topics</div>', unsafe_allow_html=True)
+        tags = " ".join(f'<span class="ttag">{t}</span>' for t in data["topics"])
+        st.markdown(tags, unsafe_allow_html=True)
+
+    if data.get("action_items"):
+        st.markdown('<div class="sec-title">✅ Action Items</div>', unsafe_allow_html=True)
+        for grp in data["action_items"]:
+            gtitle = grp.get("group_title", "").replace("### ", "")
+            st.markdown(f'<div class="ai-title">### {gtitle}</div>', unsafe_allow_html=True)
+            if grp.get("description"):
+                st.markdown(f'<div class="ai-desc">{grp["description"]}</div>', unsafe_allow_html=True)
+            for item in grp.get("items", []):
+                st.markdown(
+                    f'<div class="ai-item"><span class="ai-who">{item["assignee"]}</span>'
+                    f' {item["task"]}</div>',
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown('<div class="sec-title">💬 Transcript</div>', unsafe_allow_html=True)
+    src  = data.get("corrected_transcript") or transcript
+    rows = "".join(
+        f'<div class="tr-row"><span class="tr-spk">{e["speaker"]}:</span>'
+        f'<span>{e["text"]}</span></div>'
+        for e in src
+    )
+    st.markdown(rows, unsafe_allow_html=True)
+
+    # 下載按鈕
+    st.divider()
+    c1, c2, _ = st.columns([2, 2, 4])
+    fname = info.get("title", "meeting").replace(" ", "_")
+    with c1:
+        st.download_button(
+            "⬇ 下載會議記錄（.txt）",
+            plain_text(data, info, transcript),
+            f"{fname}.txt",
+            type="primary",
+        )
+    with c2:
+        st.download_button(
+            "⬇ 下載 JSON（可重新載入）",
+            json.dumps(
+                {"transcript": transcript, "analysis": data, "meeting_info": info},
+                ensure_ascii=False, indent=2
+            ),
+            f"{fname}.json",
+        )
+
+
 def plain_text(data: dict, info: dict, transcript: list) -> str:
     lines = [
         info.get("title", "會議記錄"),
@@ -321,7 +426,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab_up, tab_rec = st.tabs(["📁 上傳音檔", "🎤 即時錄音"])
+tab_up, tab_rec, tab_hist = st.tabs(["📁 上傳音檔", "🎤 即時錄音", "📚 歷史記錄"])
 
 # ── Tab 1: Upload ──────────────────────────────────────────────────────────────
 with tab_up:
@@ -451,74 +556,75 @@ if st.session_state.transcript:
                     result = analyze_with_groq(st.session_state.transcript, info, groq_key)
                     st.session_state.analysis    = result
                     st.session_state.meeting_info = info
+                    save_to_history(st.session_state.transcript, result, info)
                     st.rerun()
                 except Exception as e:
                     st.error(f"分析失敗：{e}")
 
-# ── Results ────────────────────────────────────────────────────────────────────
-if st.session_state.analysis:
-    data = st.session_state.analysis
-    info = st.session_state.meeting_info
-    participants = info.get("participants", [])
+# ── Tab 3: History ─────────────────────────────────────────────────────────────
+with tab_hist:
+    history = st.session_state.history
+
+    # ── 載入 JSON 紀錄 ──
+    st.markdown("**載入過去儲存的 JSON 紀錄**")
+    loaded_file = st.file_uploader(
+        "上傳之前下載的 .json 檔案",
+        type=["json"],
+        key="hist_upload",
+        label_visibility="collapsed",
+    )
+    if loaded_file:
+        try:
+            rec = json.loads(loaded_file.read().decode("utf-8"))
+            if "transcript" in rec and "analysis" in rec and "meeting_info" in rec:
+                save_to_history(rec["transcript"], rec["analysis"], rec["meeting_info"])
+                st.success(f"已載入：{rec['meeting_info'].get('title','')}")
+                st.rerun()
+            else:
+                st.error("格式不正確，請上傳由本系統產生的 .json 檔案")
+        except Exception as e:
+            st.error(f"載入失敗：{e}")
 
     st.divider()
 
-    badges = " ".join(f'<span class="pbadge">[{p}]</span>' for p in participants)
-    st.markdown(
-        f'<div class="res-header">'
-        f'<h2>{info.get("title","會議記錄")}</h2>'
-        f'<div class="meta">🕐 {info.get("date","")} &nbsp;·&nbsp; 參與者：{badges}</div>'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
+    if not history:
+        st.info("📭 還沒有歷史紀錄。完成 AI 分析後會自動儲存，或上傳之前的 .json 檔案。")
+    else:
+        st.markdown(f"**共 {len(history)} 筆紀錄**")
+        col_list, col_detail = st.columns([1, 2])
 
-    if data.get("summary"):
-        st.markdown('<div class="sec-title">📋 Meeting Summary</div>', unsafe_allow_html=True)
-        for sec in data["summary"]:
-            title = sec.get("title", "").replace("### ", "")
-            st.markdown(f'<div class="sum-h">### {title}</div>', unsafe_allow_html=True)
-            if sec.get("overview"):
-                st.markdown(f'<div class="sum-ov">{sec["overview"]}</div>', unsafe_allow_html=True)
-            for b in sec.get("bullets", []):
-                st.markdown(f'<div class="bullet">{b.lstrip("- ")}</div>', unsafe_allow_html=True)
-
-    if data.get("topics"):
-        st.markdown('<div class="sec-title">🏷 Topics</div>', unsafe_allow_html=True)
-        tags = " ".join(f'<span class="ttag">{t}</span>' for t in data["topics"])
-        st.markdown(tags, unsafe_allow_html=True)
-
-    if data.get("action_items"):
-        st.markdown('<div class="sec-title">✅ Action Items</div>', unsafe_allow_html=True)
-        for grp in data["action_items"]:
-            gtitle = grp.get("group_title", "").replace("### ", "")
-            st.markdown(f'<div class="ai-title">### {gtitle}</div>', unsafe_allow_html=True)
-            if grp.get("description"):
-                st.markdown(f'<div class="ai-desc">{grp["description"]}</div>', unsafe_allow_html=True)
-            for item in grp.get("items", []):
+        with col_list:
+            for i, rec in enumerate(history):
+                is_active = (st.session_state.hist_idx == i)
+                card_cls  = "hist-card active" if is_active else "hist-card"
+                participants_str = " · ".join(rec.get("participants", []))
                 st.markdown(
-                    f'<div class="ai-item"><span class="ai-who">{item["assignee"]}</span>'
-                    f' {item["task"]}</div>',
+                    f'<div class="{card_cls}">'
+                    f'<div class="hist-title">{rec["title"]}</div>'
+                    f'<div class="hist-meta">{rec["date"]}</div>'
+                    f'<div class="hist-meta">{participants_str}</div>'
+                    f'</div>',
                     unsafe_allow_html=True,
                 )
+                if st.button("查看", key=f"view_{i}", use_container_width=True):
+                    st.session_state.hist_idx = i
+                    st.rerun()
 
-    st.markdown('<div class="sec-title">📝 Notes</div>', unsafe_allow_html=True)
-    st.text_area("備註", height=80, label_visibility="collapsed", key="notes_ta")
+        with col_detail:
+            idx = st.session_state.hist_idx
+            if idx is not None and idx < len(history):
+                rec = history[idx]
+                render_results(rec["analysis"], rec["meeting_info"], rec["transcript"])
+            else:
+                st.info("← 點擊左側的紀錄來查看內容")
 
-    st.markdown('<div class="sec-title">💬 Transcript</div>', unsafe_allow_html=True)
-    src  = data.get("corrected_transcript") or st.session_state.transcript
-    rows = "".join(
-        f'<div class="tr-row">'
-        f'<span class="tr-spk">{e["speaker"]}:</span>'
-        f'<span>{e["text"]}</span></div>'
-        for e in src
-    )
-    st.markdown(rows, unsafe_allow_html=True)
 
+# ── Current results ────────────────────────────────────────────────────────────
+if st.session_state.analysis:
     st.divider()
-    full = plain_text(data, info, st.session_state.transcript)
-    st.download_button(
-        "⬇ 下載完整會議記錄（.txt）",
-        full,
-        f"meeting_{datetime.now():%Y%m%d_%H%M}.txt",
-        type="primary",
+    st.markdown('<div class="sec-title">📋 本次分析結果</div>', unsafe_allow_html=True)
+    render_results(
+        st.session_state.analysis,
+        st.session_state.meeting_info,
+        st.session_state.transcript,
     )
