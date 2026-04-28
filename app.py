@@ -138,6 +138,25 @@ def secs_hms(s: float) -> str:
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
 
 
+def _friendly_error(e: Exception) -> str:
+    """將 Groq API 錯誤轉成友善的中文訊息。"""
+    import re
+    msg = str(e)
+    # 429 rate limit
+    if "429" in msg or "rate_limit_exceeded" in msg:
+        wait = re.search(r"try again in\s+([\d]+m[\d.]+s|[\d.]+s|[\d]+m)", msg)
+        wait_str = f"請等待 **{wait.group(1)}** 後再試。" if wait else "請稍後再試。"
+        if "ASPH" in msg or "seconds of audio" in msg:
+            return f"⏱ Groq 免費方案每小時音訊轉錄量已達上限（7,200 秒）。{wait_str}"
+        if "TPM" in msg or "tokens per minute" in msg:
+            return f"⏱ Groq 免費方案每分鐘 Token 用量已達上限。{wait_str}"
+        return f"⏱ Groq API 請求次數已達上限。{wait_str}"
+    # 413 too large
+    if "413" in msg:
+        return "📏 逐字稿過長，已超過 Groq 模型的 Token 上限，請縮短錄音後再試。"
+    return msg
+
+
 def _ffmpeg_ok() -> bool:
     try:
         subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
@@ -490,7 +509,7 @@ with tab_up:
                         st.success(f"轉錄完成！共 {len(segs)} 段，已自動儲存至歷史記錄。")
                         st.rerun()
                     except Exception as e:
-                        st.error(f"轉錄失敗：{e}")
+                        st.error(_friendly_error(e))
 
 # ── Tab 2: Record ──────────────────────────────────────────────────────────────
 with tab_rec:
@@ -525,7 +544,7 @@ with tab_rec:
                             st.success("轉錄完成！已自動儲存至歷史記錄。")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"錯誤：{e}")
+                            st.error(_friendly_error(e))
     except Exception:
         st.warning("即時錄音需要 Streamlit ≥ 1.31，請改用「上傳音檔」分頁。")
 
@@ -660,7 +679,7 @@ if st.session_state.transcript:
                     )
                     st.rerun()
                 except Exception as e:
-                    st.error(f"分析失敗：{e}")
+                    st.error(_friendly_error(e))
 
 # ── Current results ────────────────────────────────────────────────────────────
 if st.session_state.analysis:
