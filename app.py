@@ -3,6 +3,7 @@ MeetTranscribe — Streamlit 版（使用 Groq，完全免費）
 上傳音檔（最大 100 MB）→ Groq Whisper 轉錄 → 指定發言者 → Groq Llama 分析
 """
 
+import base64
 import json
 import os
 import subprocess
@@ -114,8 +115,9 @@ if not st.session_state["_history_loaded"]:
 
 
 def _persist_history() -> None:
-    """將目前歷史記錄同步至瀏覽器 localStorage。"""
-    data = json.dumps(st.session_state.history, ensure_ascii=False)
+    """將目前歷史記錄同步至瀏覽器 localStorage（音訊檔案不存入，避免超過大小限制）。"""
+    slim = [{k: v for k, v in r.items() if k not in ("audio_bytes",)} for r in st.session_state.history]
+    data = json.dumps(slim, ensure_ascii=False)
     components.html(
         f'<script>localStorage.setItem("meetTranscribeHistory",{json.dumps(data)});</script>',
         height=0,
@@ -323,9 +325,9 @@ def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> di
     return json.loads(text)
 
 
-def save_to_history(transcript, analysis, meeting_info, record_id=None) -> str:
+def save_to_history(transcript, analysis, meeting_info, record_id=None,
+                    audio_bytes=None, audio_filename=None) -> str:
     """新增或更新歷史記錄，回傳 record id。"""
-    # 若已有 id，直接更新現有記錄
     if record_id:
         for r in st.session_state.history:
             if r["id"] == record_id:
@@ -333,17 +335,21 @@ def save_to_history(transcript, analysis, meeting_info, record_id=None) -> str:
                 r["analysis"]     = analysis
                 r["meeting_info"] = meeting_info
                 r["participants"] = meeting_info.get("participants", [])
+                if audio_bytes is not None:
+                    r["audio_bytes"]    = audio_bytes
+                    r["audio_filename"] = audio_filename or "recording"
                 return record_id
 
-    # 新增記錄
     record = {
-        "id":           datetime.now().strftime("%Y%m%d_%H%M%S"),
-        "title":        meeting_info.get("title", "未命名會議"),
-        "date":         meeting_info.get("date", ""),
-        "participants": meeting_info.get("participants", []),
-        "transcript":   transcript,
-        "analysis":     analysis,
-        "meeting_info": meeting_info,
+        "id":             datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "title":          meeting_info.get("title", "未命名會議"),
+        "date":           meeting_info.get("date", ""),
+        "participants":   meeting_info.get("participants", []),
+        "transcript":     transcript,
+        "analysis":       analysis,
+        "meeting_info":   meeting_info,
+        "audio_bytes":    audio_bytes,
+        "audio_filename": audio_filename or "recording",
     }
     st.session_state.history.insert(0, record)
     return record["id"]
@@ -371,7 +377,8 @@ def plain_text(data: dict, info: dict, transcript: list) -> str:
     return "\n".join(lines)
 
 
-def render_results(data: dict, info: dict, transcript: list, key_prefix: str = "main") -> None:
+def render_results(data: dict, info: dict, transcript: list, key_prefix: str = "main",
+                   audio_bytes: bytes | None = None, audio_filename: str = "recording") -> None:
     participants = info.get("participants", [])
     badges = " ".join(f'<span class="pbadge">[{p}]</span>' for p in participants)
     st.markdown(
@@ -379,6 +386,11 @@ def render_results(data: dict, info: dict, transcript: list, key_prefix: str = "
         f'<div class="meta">🕐 {info.get("date","")} &nbsp;·&nbsp; 參與者：{badges}</div></div>',
         unsafe_allow_html=True,
     )
+    if audio_bytes:
+        st.markdown('<div class="sec-title">🎵 原始錄音</div>', unsafe_allow_html=True)
+        st.audio(audio_bytes)
+        st.download_button("⬇ 下載原始錄音", audio_bytes, audio_filename,
+                           key=f"{key_prefix}_dl_audio")
     if data.get("summary"):
         st.markdown('<div class="sec-title">📋 Meeting Summary</div>', unsafe_allow_html=True)
         for sec in data["summary"]:
@@ -491,7 +503,8 @@ with tab_up:
             else:
                 with st.spinner("Groq Whisper 轉錄中，請稍候…"):
                     try:
-                        segs = transcribe_audio(uploaded.read(), uploaded.name, groq_key, LANG_MAP[language])
+                        audio_data = uploaded.read()
+                        segs = transcribe_audio(audio_data, uploaded.name, groq_key, LANG_MAP[language])
                         entries = [
                             {"speaker": speaker_names[0], "text": s["text"],
                              "displayTime": secs_hms(s["start"]), "rawTime": int(s["start"] * 1000)}
@@ -505,7 +518,10 @@ with tab_up:
                         st.session_state.transcript        = entries
                         st.session_state.analysis          = None
                         st.session_state.meeting_info      = info
-                        st.session_state.current_record_id = save_to_history(entries, None, info)
+                        st.session_state.current_record_id = save_to_history(
+                            entries, None, info,
+                            audio_bytes=audio_data, audio_filename=uploaded.name,
+                        )
                         st.success(f"轉錄完成！共 {len(segs)} 段，已自動儲存至歷史記錄。")
                         st.rerun()
                     except Exception as e:
@@ -526,7 +542,8 @@ with tab_rec:
                 else:
                     with st.spinner("Groq Whisper 轉錄中…"):
                         try:
-                            segs = transcribe_audio(audio_val.read(), "recording.wav", groq_key, LANG_MAP[language])
+                            audio_data = audio_val.read()
+                            segs = transcribe_audio(audio_data, "recording.wav", groq_key, LANG_MAP[language])
                             entries = [
                                 {"speaker": speaker_names[0], "text": s["text"],
                                  "displayTime": secs_hms(s["start"]), "rawTime": int(s["start"] * 1000)}
@@ -540,7 +557,10 @@ with tab_rec:
                             st.session_state.transcript        = entries
                             st.session_state.analysis          = None
                             st.session_state.meeting_info      = info
-                            st.session_state.current_record_id = save_to_history(entries, None, info)
+                            st.session_state.current_record_id = save_to_history(
+                                entries, None, info,
+                                audio_bytes=audio_data, audio_filename="recording.wav",
+                            )
                             st.success("轉錄完成！已自動儲存至歷史記錄。")
                             st.rerun()
                         except Exception as e:
@@ -600,15 +620,21 @@ with tab_hist:
             idx = st.session_state.hist_idx
             if idx is not None and idx < len(history):
                 rec = history[idx]
+                ab = rec.get("audio_bytes")
+                af = rec.get("audio_filename", "recording")
                 if rec["analysis"] is None:
                     st.info("📝 此記錄尚未進行 AI 分析，僅顯示逐字稿。")
                     info = rec["meeting_info"]
                     st.markdown(f"**{info.get('title','')}**　{info.get('date','')}")
+                    if ab:
+                        st.audio(ab)
+                        st.download_button("⬇ 下載原始錄音", ab, af,
+                                           key=f"hist_{idx}_dl_audio_raw")
                     fname = info.get("title", "transcript").replace(" ", "_")
                     st.download_button(
                         "⬇ 下載逐字稿",
                         "\n".join(f"{e['speaker']}: {e['text']}" for e in rec["transcript"]),
-                        f"{fname}.txt",
+                        f"{fname}.txt", key=f"hist_{idx}_dl_txt_raw",
                     )
                     for e in rec["transcript"]:
                         st.markdown(
@@ -617,7 +643,8 @@ with tab_hist:
                             unsafe_allow_html=True,
                         )
                 else:
-                    render_results(rec["analysis"], rec["meeting_info"], rec["transcript"], key_prefix=f"hist_{idx}")
+                    render_results(rec["analysis"], rec["meeting_info"], rec["transcript"],
+                                   key_prefix=f"hist_{idx}", audio_bytes=ab, audio_filename=af)
             else:
                 st.info("← 點擊左側紀錄查看內容")
 
