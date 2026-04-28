@@ -564,9 +564,19 @@ with tab_hist:
                     f'<div class="hist-meta">{" · ".join(rec.get("participants", []))}</div></div>',
                     unsafe_allow_html=True,
                 )
-                if st.button("查看", key=f"view_{i}", use_container_width=True):
-                    st.session_state.hist_idx = i
-                    st.rerun()
+                c_view, c_del = st.columns(2)
+                with c_view:
+                    if st.button("查看", key=f"view_{i}", use_container_width=True):
+                        st.session_state.hist_idx = i
+                        st.rerun()
+                with c_del:
+                    if st.button("🗑", key=f"del_{i}", use_container_width=True, help="刪除此記錄"):
+                        st.session_state.history.pop(i)
+                        if st.session_state.hist_idx == i:
+                            st.session_state.hist_idx = None
+                        elif st.session_state.hist_idx is not None and st.session_state.hist_idx > i:
+                            st.session_state.hist_idx -= 1
+                        st.rerun()
         with col_detail:
             idx = st.session_state.hist_idx
             if idx is not None and idx < len(history):
