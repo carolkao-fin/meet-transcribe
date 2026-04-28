@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
+from streamlit_javascript import st_javascript
 
 # ── 頁面設定 ───────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -85,12 +87,35 @@ for k, v in {
     "hist_idx":          None,
     "current_record_id": None,
     "_last_uploaded":    "",
+    "_history_loaded":   False,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
 if "meeting_title_key" not in st.session_state:
     st.session_state["meeting_title_key"] = f"會議記錄 {datetime.now():%Y-%m-%d}"
+
+# ── 從 localStorage 載入歷史記錄（每個 session 只做一次）────────────────────────
+if not st.session_state["_history_loaded"]:
+    _raw = st_javascript('localStorage.getItem("meetTranscribeHistory")')
+    if _raw and _raw != 0 and _raw not in ("null", "undefined"):
+        try:
+            _loaded = json.loads(_raw)
+            if isinstance(_loaded, list) and _loaded:
+                st.session_state.history = _loaded
+        except Exception:
+            pass
+    if _raw != 0:          # 0 表示 JS 還沒執行完，等下次 rerun 再標記
+        st.session_state["_history_loaded"] = True
+
+
+def _persist_history() -> None:
+    """將目前歷史記錄同步至瀏覽器 localStorage。"""
+    data = json.dumps(st.session_state.history, ensure_ascii=False)
+    components.html(
+        f'<script>localStorage.setItem("meetTranscribeHistory",{json.dumps(data)});</script>',
+        height=0,
+    )
 
 # ── 常數 ───────────────────────────────────────────────────────────────────────
 LANG_MAP      = {"自動偵測": None, "中文 (zh)": "zh", "英文 (en)": "en"}
@@ -630,3 +655,6 @@ if st.session_state.analysis:
         st.session_state.meeting_info,
         st.session_state.transcript,
     )
+
+# ── 每次 run 結束時將歷史記錄同步至 localStorage ───────────────────────────────
+_persist_history()
