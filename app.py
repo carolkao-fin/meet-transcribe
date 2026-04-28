@@ -95,7 +95,8 @@ for k, v in {
 
 # ── 常數 ───────────────────────────────────────────────────────────────────────
 LANG_MAP  = {"自動偵測": None, "中文 (zh)": "zh", "英文 (en)": "en"}
-MODEL     = "gemini-2.0-flash"
+# 模型優先順序：依序嘗試，遇到配額問題自動換下一個
+MODELS    = ["gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-8b"]
 MIME_MAP  = {
     ".mp3": "audio/mpeg", ".wav": "audio/wav",
     ".m4a": "audio/mp4",  ".aac": "audio/aac",
@@ -112,6 +113,31 @@ def secs_hms(s: float) -> str:
 def _gemini_client(api_key: str):
     from google import genai
     return genai.Client(api_key=api_key)
+
+
+def _generate_with_fallback(client, contents: list) -> str:
+    """依序嘗試多個模型，遇到 429 自動換下一個。"""
+    last_err = None
+    for model in MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+            )
+            return response.text
+        except Exception as e:
+            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
+                last_err = e
+                time.sleep(2)
+                continue
+            raise   # 其他錯誤直接拋出
+    raise RuntimeError(
+        f"所有模型配額均已用盡：{last_err}\n\n"
+        "解決方法：\n"
+        "1. 請至 aistudio.google.com 重新建立新的 API Key\n"
+        "2. 確認 Key 是從 AI Studio 建立（非 Google Cloud Console）\n"
+        "3. 等幾分鐘後再試（每分鐘有請求上限）"
+    )
 
 
 def transcribe_audio(data: bytes, filename: str, api_key: str, lc: str | None) -> list[dict]:
@@ -159,15 +185,12 @@ def transcribe_audio(data: bytes, filename: str, api_key: str, lc: str | None) -
 - 保留原始語言，不要翻譯
 - 只輸出轉錄結果"""
 
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=[
-                {"role": "user", "parts": [
-                    {"file_data": {"file_uri": uploaded.uri, "mime_type": mime_type}},
-                    {"text": prompt},
-                ]},
-            ],
-        )
+        text = _generate_with_fallback(client, [
+            {"role": "user", "parts": [
+                {"file_data": {"file_uri": uploaded.uri, "mime_type": mime_type}},
+                {"text": prompt},
+            ]},
+        ])
 
         # 刪除暫存檔案（Gemini File API 48 小時後自動刪除）
         try:
@@ -179,7 +202,7 @@ def transcribe_audio(data: bytes, filename: str, api_key: str, lc: str | None) -
 
         # 解析時間戳
         segs = []
-        for line in response.text.strip().splitlines():
+        for line in text.strip().splitlines():
             m = re.match(r"\[(\d+):(\d+)\]\s*(.+)", line.strip())
             if m:
                 mins, secs, text = m.groups()
@@ -188,8 +211,8 @@ def transcribe_audio(data: bytes, filename: str, api_key: str, lc: str | None) -
                     segs.append({"start": float(start), "text": text.strip()})
 
         # 若 Gemini 沒有輸出時間戳，視為一整段
-        if not segs and response.text.strip():
-            segs = [{"start": 0.0, "text": response.text.strip()}]
+        if not segs and text.strip():
+            segs = [{"start": 0.0, "text": text.strip()}]
 
         return segs
 
@@ -243,12 +266,10 @@ def analyze_with_gemini(transcript: list, meeting_info: dict, api_key: str) -> d
 
 要求：summary 2–4 小節、每節 3–6 要點並標明發言者；action_items 指明負責人；topics 2–4 個標籤。"""
 
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=[{"role": "user", "parts": [{"text": prompt}]}],
-    )
-
-    text = response.text.strip()
+    text = _generate_with_fallback(
+        client,
+        [{"role": "user", "parts": [{"text": prompt}]}],
+    ).strip()
     if "```json" in text:
         text = text.split("```json")[1].split("```")[0].strip()
     elif text.startswith("```"):
