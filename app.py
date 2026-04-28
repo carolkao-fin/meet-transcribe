@@ -352,7 +352,7 @@ def plain_text(data: dict, info: dict, transcript: list) -> str:
     return "\n".join(lines)
 
 
-def render_results(data: dict, info: dict, transcript: list) -> None:
+def render_results(data: dict, info: dict, transcript: list, key_prefix: str = "main") -> None:
     participants = info.get("participants", [])
     badges = " ".join(f'<span class="pbadge">[{p}]</span>' for p in participants)
     st.markdown(
@@ -392,11 +392,13 @@ def render_results(data: dict, info: dict, transcript: list) -> None:
     fname = info.get("title", "meeting").replace(" ", "_")
     c1, c2, _ = st.columns([2, 2, 4])
     with c1:
-        st.download_button("⬇ 下載會議記錄 (.txt)", plain_text(data, info, transcript), f"{fname}.txt", type="primary")
+        st.download_button("⬇ 下載會議記錄 (.txt)", plain_text(data, info, transcript), f"{fname}.txt",
+                           type="primary", key=f"{key_prefix}_dl_txt")
     with c2:
         st.download_button("⬇ 下載 JSON（可重新載入）",
                            json.dumps({"transcript": transcript, "analysis": data, "meeting_info": info},
-                                      ensure_ascii=False, indent=2), f"{fname}.json")
+                                      ensure_ascii=False, indent=2), f"{fname}.json",
+                           key=f"{key_prefix}_dl_json")
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -586,7 +588,7 @@ with tab_hist:
                             unsafe_allow_html=True,
                         )
                 else:
-                    render_results(rec["analysis"], rec["meeting_info"], rec["transcript"])
+                    render_results(rec["analysis"], rec["meeting_info"], rec["transcript"], key_prefix=f"hist_{idx}")
             else:
                 st.info("← 點擊左側紀錄查看內容")
 
