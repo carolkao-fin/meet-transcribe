@@ -663,4 +663,7 @@ if st.session_state.analysis:
     )
 
 # ── 每次 run 結束時將歷史記錄同步至 localStorage ───────────────────────────────
-_persist_history()
+# 必須等 _history_loaded=True 才能寫入，否則第一次 render JS 尚未執行（回傳 0），
+# history 還是空的，會把 localStorage 的舊資料覆蓋掉。
+if st.session_state["_history_loaded"]:
+    _persist_history()
