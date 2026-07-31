@@ -6,6 +6,33 @@
 
 ---
 
+## v1.6 — 2026-07-31
+
+### 修正
+- **修復大檔案轉錄出現 `400 could not process file` 的問題**
+  - 根本原因：`_split_audio` 切片時，若音訊總長剛好落在 8 分鐘倍數之後一點（例如 3840.02 秒），
+    會多切出一段約 0.02 秒的 mp3。ffmpeg 對這種長度產出沒有音訊框的空檔，
+    而舊碼只用 `Path(out).exists()` 判斷成功——檔案存在但內容是空的，仍被送給 Whisper
+  - 解法：捨棄長度 < 1 秒的尾段；改為同時檢查 ffmpeg `returncode` 與輸出檔大小（≥ 2048 bytes）
+- **切片失敗不再靜默**：ffmpeg 失敗時 raise 並附上 stderr 尾三行，指出是第幾段、returncode 多少
+- **送出前防呆**：`_call_whisper` 擋掉小於 2048 bytes 的空檔，不再讓 Groq 回英文原文錯誤
+- 修復 `_ffmpeg_ok()` 未檢查 returncode，ffmpeg 裝壞仍回報可用
+- 修復 `_audio_duration` 在 webm / ogg 等缺少 stream duration 的容器上回傳 0，
+  導致誤報「找不到 ffmpeg」：改為退回 `format.duration`
+- 暫存切片改用 `try/finally` 清理，轉錄中途失敗不再殘留檔案
+
+### 改善
+- 切片改用 input seeking（`-ss` 移到 `-i` 之前），長音訊不必每段從頭解碼，大幅加快分割
+- 切片檔名不再產生 `tmpXXX.m4a_c0.mp3` 這種雙副檔名
+- `_friendly_error` 新增 400 的中文說明，並列出 Groq 實際支援的格式
+  （flac / mp3 / mp4 / mpeg / mpga / m4a / ogg / opus / wav / webm，**不含 raw .aac**）
+
+### 已知問題
+- 上傳清單仍包含 `.aac`，但 Groq 不支援 raw ADTS。24 MB 以下的 .aac 會被拒；
+  超過 24 MB 反而因為被 ffmpeg 轉成 mp3 而成功——行為不一致，待修
+
+---
+
 ## v1.5 — 2026-05-05
 
 ### 新功能

@@ -127,6 +127,11 @@ def _persist_history() -> None:
 LANG_MAP      = {"自動偵測": None, "中文 (zh)": "zh", "英文 (en)": "en"}
 WHISPER_MAX   = 24 * 1_048_576          # 24 MB
 WHISPER_MODEL = "whisper-large-v3"
+
+# 切片健康檢查：小於 MIN_CHUNK_BYTES 視為 ffmpeg 產出的空檔，
+# 短於 MIN_CHUNK_SEC 的尾段直接捨棄（Whisper 無法處理零長度音訊）
+MIN_CHUNK_BYTES = 2048
+MIN_CHUNK_SEC   = 1.0
 CHAT_MODEL    = "llama-3.3-70b-versatile"
 
 # Groq 免費方案 TPM 上限 ~12,000 tokens；
@@ -156,13 +161,23 @@ def _friendly_error(e: Exception) -> str:
     # 413 too large
     if "413" in msg:
         return "📏 逐字稿過長，已超過 Groq 模型的 Token 上限，請縮短錄音後再試。"
+    # 400 檔案無法解碼
+    if "could not process file" in msg or "valid media file" in msg:
+        return (
+            "🎧 Groq 無法解析這個音訊檔，可能原因：\n\n"
+            "- 副檔名與實際格式不符（例如 m4a 被改名成 .mp3）\n"
+            "- 格式不在 Groq 支援清單內：flac / mp3 / mp4 / mpeg / mpga / m4a / "
+            "ogg / opus / wav / webm（**不含 raw .aac**）\n"
+            "- 檔案損毀或內容為空\n\n"
+            "建議先確認檔案能正常播放，或轉存成 mp3 / wav 後再上傳。"
+        )
     return msg
 
 
 def _ffmpeg_ok() -> bool:
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
-        return True
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        return r.returncode == 0
     except Exception:
         return False
 
@@ -170,40 +185,73 @@ def _ffmpeg_ok() -> bool:
 def _audio_duration(path: str) -> float:
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", path],
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-show_format", path],
             capture_output=True, text=True, timeout=30,
         )
         info = json.loads(r.stdout)
-        return next(
+        dur = next(
             (float(s["duration"]) for s in info.get("streams", []) if "duration" in s), 0.0
         )
+        # webm / ogg 等容器常缺少 stream duration，退回 format duration
+        if not dur:
+            dur = float(info.get("format", {}).get("duration") or 0.0)
+        return dur
     except Exception:
         return 0.0
 
 
 def _split_audio(src: str, chunk_min: int = 8) -> list | None:
+    """切成數段 mp3。ffmpeg / ffprobe 不可用時回傳 None；
+    切片本身失敗則 raise，並帶上 ffmpeg 的 stderr 方便診斷。"""
     if not _ffmpeg_ok():
         return None
     dur = _audio_duration(src)
     if not dur:
         return None
-    chunks, step, t = [], chunk_min * 60, 0.0
+
+    # 用去掉原副檔名的 base，避免產生 xxx.m4a_c0.mp3 這種雙副檔名
+    base = str(Path(src).with_suffix(""))
+    chunks, step, t, idx = [], chunk_min * 60, 0.0, 0
     while t < dur:
         length = min(step, dur - t)
-        out = src + f"_c{int(t)}.mp3"
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", src,
-             "-ss", str(t), "-t", str(length),
-             "-ac", "1", "-ar", "16000", "-ab", "48k", out],
-            capture_output=True, timeout=300,
+        if length < MIN_CHUNK_SEC:      # 捨棄零長度尾段，否則 ffmpeg 產出空檔
+            break
+        out = f"{base}_c{idx}.mp3"
+        # -ss 放在 -i 之前：input seeking，不必每段都從頭解碼
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(t), "-i", src, "-t", str(length),
+             "-ac", "1", "-ar", "16000", "-b:a", "48k", out],
+            capture_output=True, text=True, timeout=300,
         )
-        if Path(out).exists():
-            chunks.append((out, length))
+        size = Path(out).stat().st_size if Path(out).exists() else 0
+        if r.returncode != 0 or size < MIN_CHUNK_BYTES:
+            for done, _ in chunks:      # 清掉已產生的切片，別留垃圾
+                try:
+                    os.unlink(done)
+                except Exception:
+                    pass
+            try:
+                os.unlink(out)
+            except Exception:
+                pass
+            tail = " / ".join((r.stderr or "").strip().splitlines()[-3:]) or "無"
+            raise RuntimeError(
+                f"ffmpeg 分割第 {idx+1} 段失敗"
+                f"（returncode={r.returncode}，輸出 {size} bytes）。\n\nffmpeg 訊息：{tail}"
+            )
+        chunks.append((out, length))
         t += length
+        idx += 1
     return chunks or None
 
 
 def _call_whisper(client, path: str, lc: str | None) -> list[dict]:
+    size = os.path.getsize(path)
+    if size < MIN_CHUNK_BYTES:
+        raise ValueError(
+            f"要送出的音訊只有 {size} bytes，內容為空或已損毀，已中止上傳。"
+        )
     with open(path, "rb") as fh:
         r = client.audio.transcriptions.create(
             model=WHISPER_MODEL,
@@ -240,18 +288,25 @@ def transcribe_audio(data: bytes, filename: str, groq_key: str, lc: str | None) 
         chunks = _split_audio(tmp_path)
         if not chunks:
             raise ValueError(
-                f"檔案 {size/1_048_576:.1f} MB 超過 25 MB，且找不到 ffmpeg 無法自動分割。\n"
-                "請安裝 ffmpeg 或先壓縮音訊後再上傳。"
+                f"檔案 {size/1_048_576:.1f} MB 超過 24 MB，需要 ffmpeg 自動分割，"
+                "但找不到 ffmpeg／ffprobe，或無法讀取這個檔案的音訊長度。\n"
+                "請確認檔案格式正常，或先壓縮成 24 MB 以下再上傳。"
             )
         segs, offset = [], 0.0
         pbar = st.progress(0, text="分割並轉錄中…")
-        for i, (cp, dur) in enumerate(chunks):
-            pbar.progress((i + 1) / len(chunks), text=f"轉錄第 {i+1}/{len(chunks)} 段…")
-            for s in _call_whisper(client, cp, lc):
-                segs.append({"start": s["start"] + offset, "text": s["text"]})
-            os.unlink(cp)
-            offset += dur
-        pbar.empty()
+        try:
+            for i, (cp, dur) in enumerate(chunks):
+                pbar.progress((i + 1) / len(chunks), text=f"轉錄第 {i+1}/{len(chunks)} 段…")
+                for s in _call_whisper(client, cp, lc):
+                    segs.append({"start": s["start"] + offset, "text": s["text"]})
+                offset += dur
+        finally:
+            pbar.empty()
+            for cp, _ in chunks:        # 中途失敗也要清掉暫存切片
+                try:
+                    os.unlink(cp)
+                except Exception:
+                    pass
         return segs
     finally:
         try:
