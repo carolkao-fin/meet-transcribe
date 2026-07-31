@@ -132,6 +132,12 @@ WHISPER_MODEL = "whisper-large-v3"
 # 短於 MIN_CHUNK_SEC 的尾段直接捨棄（Whisper 無法處理零長度音訊）
 MIN_CHUNK_BYTES = 2048
 MIN_CHUNK_SEC   = 1.0
+
+# Groq 轉錄端點能直接解析的容器。注意不含 raw .aac（ADTS），
+# 副檔名不在此清單的檔案一律先用 ffmpeg 轉成 mp3 再送。
+GROQ_AUDIO_EXTS = {
+    ".flac", ".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".ogg", ".opus", ".wav", ".webm",
+}
 CHAT_MODEL    = "llama-3.3-70b-versatile"
 
 # Groq 免費方案 TPM 上限 ~12,000 tokens；
@@ -246,6 +252,27 @@ def _split_audio(src: str, chunk_min: int = 8) -> list | None:
     return chunks or None
 
 
+def _transcode_to_mp3(src: str) -> str:
+    """把 Groq 不支援的容器（例如 raw .aac）轉成 mp3。失敗則 raise。"""
+    out = f"{Path(src).with_suffix('')}_conv.mp3"
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", src, "-ac", "1", "-ar", "16000", "-b:a", "48k", out],
+        capture_output=True, text=True, timeout=600,
+    )
+    size = Path(out).stat().st_size if Path(out).exists() else 0
+    if r.returncode != 0 or size < MIN_CHUNK_BYTES:
+        try:
+            os.unlink(out)
+        except Exception:
+            pass
+        tail = " / ".join((r.stderr or "").strip().splitlines()[-3:]) or "無"
+        raise RuntimeError(
+            f"ffmpeg 轉檔失敗（returncode={r.returncode}，輸出 {size} bytes）。"
+            f"\n\nffmpeg 訊息：{tail}"
+        )
+    return out
+
+
 def _call_whisper(client, path: str, lc: str | None) -> list[dict]:
     size = os.path.getsize(path)
     if size < MIN_CHUNK_BYTES:
@@ -280,7 +307,19 @@ def transcribe_audio(data: bytes, filename: str, groq_key: str, lc: str | None) 
         tmp.write(data)
         tmp_path = tmp.name
 
+    tmp_files = [tmp_path]
     try:
+        # Groq 不認識的容器（raw .aac 等）先轉成 mp3，否則會回 400 invalid media file
+        if suffix not in GROQ_AUDIO_EXTS:
+            if not _ffmpeg_ok():
+                raise ValueError(
+                    f"Groq 不支援 {suffix} 格式，且找不到 ffmpeg 無法自動轉檔。\n"
+                    "請先自行轉存成 mp3 或 wav 再上傳。"
+                )
+            with st.spinner(f"{suffix} 非 Groq 支援格式，正在轉成 mp3…"):
+                tmp_path = _transcode_to_mp3(tmp_path)
+            tmp_files.append(tmp_path)
+
         size = os.path.getsize(tmp_path)
         if size <= WHISPER_MAX:
             return _call_whisper(client, tmp_path, lc)
@@ -309,10 +348,11 @@ def transcribe_audio(data: bytes, filename: str, groq_key: str, lc: str | None) 
                     pass
         return segs
     finally:
-        try:
-            os.unlink(tmp_path)
-        except Exception:
-            pass
+        for p in tmp_files:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> dict:

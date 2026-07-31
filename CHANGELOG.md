@@ -26,10 +26,9 @@
 - 切片檔名不再產生 `tmpXXX.m4a_c0.mp3` 這種雙副檔名
 - `_friendly_error` 新增 400 的中文說明，並列出 Groq 實際支援的格式
   （flac / mp3 / mp4 / mpeg / mpga / m4a / ogg / opus / wav / webm，**不含 raw .aac**）
-
-### 已知問題
-- 上傳清單仍包含 `.aac`，但 Groq 不支援 raw ADTS。24 MB 以下的 .aac 會被拒；
-  超過 24 MB 反而因為被 ffmpeg 轉成 mp3 而成功——行為不一致，待修
+- **修復 `.aac` 上傳被拒**：Groq 不支援 raw ADTS，過去 24 MB 以下的 .aac 會直接回 400，
+  超過 24 MB 反而因為被 ffmpeg 轉成 mp3 而成功。現在改為：副檔名不在 Groq 支援清單內時，
+  一律先用 ffmpeg 轉成 mp3（mono / 16 kHz / 48 kbps）再送，行為一致
 
 ---
 
