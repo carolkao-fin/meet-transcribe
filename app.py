@@ -151,12 +151,20 @@ CHAT_MODEL    = "llama-3.3-70b-versatile"
 MAX_TRANSCRIPT_CHARS = 12_000
 
 # ── 會議紀錄 .docx 樣式（對應「會議行動轉譯官」skill 的 SeaSalt.AI 規範）──────
-DOCX_TEAL  = "00897B"      # 主色
-DOCX_BODY  = "212121"      # 正文色
-DOCX_FONT  = "Arial"
-DOCX_H1_PT = 16
-DOCX_H2_PT = 13
-DOCX_BD_PT = 12            # body
+DOCX_TEAL    = "00897B"              # 主色
+DOCX_BODY    = "212121"              # 正文色
+DOCX_FONT    = "Arial"               # 拉丁字元
+DOCX_FONT_EA = "Microsoft JhengHei"  # 中日韓字元（Arial 沒有中文字符，會退回 Word 預設）
+DOCX_TITLE_PT = 22
+DOCX_H1_PT    = 18
+DOCX_H2_PT    = 14
+DOCX_META_PT  = 11
+DOCX_BD_PT    = 12                   # body
+
+# H2 自動編號用的中文數字（一、二、三…）
+_CJK_NUM = "一二三四五六七八九十"
+# 已經帶編號的標題不再重複加（「1. 」「一、」「(1)」…）
+_NUM_PREFIX_RE = re.compile(r"^\s*(?:\d+[.\)、]|[（(]\d+[）)]|[" + _CJK_NUM + r"]+[、.])\s*")
 
 # 預設五段結構；Transcript 由程式填入完整逐字稿，不交給 LLM 產生
 DEFAULT_SECTIONS = ["Meeting Summary", "Topics", "Action Items", "Notes"]
@@ -632,14 +640,30 @@ def generate_minutes(entries: list[dict], info: dict, groq_key: str,
             f"格式模板：\n{template_text[:3000]}"
         )
     else:
-        fmt_rule = (
-            "請採用以下四段結構（Transcript 由系統另外附上，你不需要輸出）：\n"
-            "1. Meeting Summary：依議題分節，每節一個 h2 小標題 + 1–2 句總結段落 + 條列各發言者論點\n"
-            "2. Topics：一段以逗號分隔的核心關鍵詞\n"
-            "3. Action Items：依任務群組分節，每組一個 h2 小標題 + 1 句說明 + "
-            "條列「【負責人】具體任務（期限：如有）」\n"
-            "4. Notes：語音辨識錯字標記、雜訊段落、人名／單位不確定項目等"
-        )
+        fmt_rule = """請採用以下四段結構（Transcript 由系統另外附上完整內容，你不需要輸出）：
+
+1. Meeting Summary
+   - 先用一段 p 總述全場：會議性質、雙方是誰、涵蓋哪些議題
+   - 再依議題分節，每節：一個 h2 小標題 → 一句 p 說明本節討論什麼 → bullets 條列各方論點
+   - 條列每句都要指明是誰說的（例如「公司代表說明…」「訪視方確認…」），
+     並盡量保留數字、公司名、代碼等具體資訊
+   - 議題請切細一點，寧可多分幾節，不要把不同主題混在同一節
+
+2. Topics
+   - 一段 p，以頓號分隔的關鍵詞列表，涵蓋全場核心名詞（人名、公司、產品、制度、代碼）
+
+3. Action Items
+   - 依任務群組分節：h2 小標題 → 一句 p 說明 → bullets 條列
+   - 條列格式「【負責人】具體任務（期限：…）」；逐字稿沒提到期限就寫
+     「（期限：未於逐字稿中提及）」
+   - 只列逐字稿中真的要求或承諾要做的事；沒有就整段寫「——」
+
+4. Notes
+   - 依性質分節（h2 小標題 + bullets），需要哪幾類就寫哪幾類：
+     發言者標記與會議基本資訊（誰是誰、哪些欄位逐字稿沒提到）、
+     專有名詞統一說明（同一個詞的多種辨識寫法統一成什麼）、
+     語音辨識錯字修正彙整（「錯字 → 正確」逐條列出）、
+     詞彙／語意待確認項目、數字與代碼記錄、雜訊與非公務段落說明"""
 
     prompt = f"""你是一名「會議行動轉譯官」，負責把會議逐字稿轉為正式會議紀錄。
 
@@ -706,9 +730,9 @@ def generate_minutes(entries: list[dict], info: dict, groq_key: str,
     )
 
 
-def _chat_json(client, messages):
+def _chat_json(client, messages, max_tokens: int = 2048):
     """呼叫 Groq 並要求 JSON 輸出；舊模型不支援 response_format 時自動退回一般模式。"""
-    kwargs = dict(model=CHAT_MODEL, messages=messages, max_tokens=2048, temperature=0.2)
+    kwargs = dict(model=CHAT_MODEL, messages=messages, max_tokens=max_tokens, temperature=0.2)
     try:
         return client.chat.completions.create(response_format={"type": "json_object"}, **kwargs)
     except Exception as e:
@@ -866,6 +890,138 @@ def _normalize_sections(data) -> list[dict]:
     return out
 
 
+# ── 逐字稿整理（補標點、標記錯字、分辨發言者角色）──────────────────────────────
+POLISH_CHUNK_CHARS = 1_200      # 每批送出的逐字稿字元數
+POLISH_TPM_BUDGET  = 10_000     # 保守值，Groq 免費方案上限 12,000 TPM
+POLISH_MIN_RATIO   = 0.6        # 整理後短於原文這個比例 → 視為模型在摘要，改用原文
+
+
+def _detect_roles(client, sample: str, title: str) -> list[str]:
+    """先看開頭一段，決定整份逐字稿要用的角色名稱，避免各批叫法不一致。"""
+    prompt = f"""以下是一場會議「{title}」逐字稿的開頭。請判斷這場對話有哪些角色
+（例如「訪視方」「公司代表」「主持人」；若能從內容判斷單位或公司名稱，請用具體名稱）。
+
+只回傳 JSON：{{"roles": ["角色1", "角色2"]}}，最多 4 個，不確定就少列。
+
+逐字稿開頭：
+{sample[:1500]}"""
+    try:
+        resp = _chat_json(client, [{"role": "user", "content": prompt}], max_tokens=200)
+        roles = json.loads(_extract_json(resp.choices[0].message.content or ""))["roles"]
+        return [str(r) for r in roles if str(r).strip()][:4]
+    except Exception:
+        return []
+
+
+def polish_transcript(entries: list[dict], groq_key: str, title: str = "",
+                      on_progress=None) -> tuple[list[dict], list[str]]:
+    """整理逐字稿：補標點、修正明顯辨識錯字並標記【原文：X】、依語意標出發言者角色。
+
+    分批送出並控制速率（Groq 免費方案 12,000 TPM）。任何一批失敗或模型把內容
+    縮短了，該批一律保留原文——寧可沒整理，也不能讓逐字稿少內容。
+
+    回傳 (整理後段落, 警告訊息)。
+    """
+    import time
+    from groq import Groq
+
+    client   = Groq(api_key=groq_key)
+    warnings: list[str] = []
+
+    # 分批：以字元數切，不切斷單一段落
+    chunks: list[list[int]] = []
+    cur, cur_len = [], 0
+    for i, e in enumerate(entries):
+        if cur and cur_len + len(e["text"]) > POLISH_CHUNK_CHARS:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        cur.append(i)
+        cur_len += len(e["text"])
+    if cur:
+        chunks.append(cur)
+
+    roles = _detect_roles(client, "\n".join(e["text"] for e in entries[:20]), title)
+    role_rule = (
+        f"發言者角色只能從這幾個裡面選：{'、'.join(roles)}；"
+        "若某段無法判斷，填「與會者（姓名未辨識）」。"
+        if roles else "請依語意判斷發言者角色；無法判斷時填「與會者（姓名未辨識）」。"
+    )
+
+    out = [dict(e) for e in entries]
+    used: list[tuple[float, int]] = []      # (時間, token 數)，用來控速
+
+    for n, idx_list in enumerate(chunks, 1):
+        if on_progress:
+            on_progress(n, len(chunks))
+
+        # 速率控制：讓最近 60 秒的用量維持在預算內
+        now = time.time()
+        used = [(t, k) for t, k in used if now - t < 60]
+        if sum(k for _, k in used) > POLISH_TPM_BUDGET and used:
+            wait = 60 - (now - used[0][0])
+            if wait > 0:
+                if on_progress:
+                    on_progress(n, len(chunks), f"（等待 Groq 速率限制，約 {int(wait)} 秒）")
+                time.sleep(min(wait, 60))
+                used = []
+
+        src = [{"i": i, "text": entries[i]["text"]} for i in idx_list]
+        prompt = f"""你是會議逐字稿整理員。以下是語音辨識產生的逐字稿片段（會議：{title}）。
+
+請對每一段做這四件事，其他一律不要動：
+1. 補上標點符號（原檔幾乎沒有標點）
+2. 修正明顯的語音辨識錯字，並在該處標記【原文：辨識結果】
+3. 刪除「呃」「那個」這類純贅詞與重複語句
+4. 判斷這段是誰說的。{role_rule}
+
+嚴格禁止：
+- 禁止摘要、濃縮或刪除任何實質內容，每一段整理後的長度應與原文相當
+- 禁止新增原文沒有的資訊
+- 無法判讀的破碎語句：保留原文並在句末標記（語意待確認），不要自行編造
+
+只回傳 JSON，i 必須與輸入一致：
+{{"paragraphs": [{{"i": 0, "speaker": "角色", "text": "整理後的文字"}}]}}
+
+逐字稿片段：
+{json.dumps(src, ensure_ascii=False)}"""
+
+        try:
+            resp = _chat_json(client, [{"role": "user", "content": prompt}], max_tokens=2048)
+            usage = getattr(resp, "usage", None)
+            used.append((time.time(), getattr(usage, "total_tokens", 3000) if usage else 3000))
+            if getattr(resp.choices[0], "finish_reason", "") == "length":
+                warnings.append(f"第 {n} 批因長度上限被截斷，該批保留原文。")
+                continue
+            data = json.loads(_extract_json(resp.choices[0].message.content or ""))
+            paras = data.get("paragraphs") or data.get("segments") or []
+            got = {int(p["i"]): p for p in paras if isinstance(p, dict) and "i" in p}
+            for i in idx_list:
+                p = got.get(i)
+                if not p:
+                    continue
+                text = str(p.get("text", "")).strip()
+                # 內容縮水就不採用——逐字稿不得被摘要
+                if len(text) < len(entries[i]["text"]) * POLISH_MIN_RATIO:
+                    continue
+                out[i]["text"] = text
+                role = str(p.get("speaker", "")).strip()
+                if role:
+                    base = entries[i]["speaker"]
+                    out[i]["speaker"] = f"{base}（{role}）" if base else role
+                    out[i]["cont"] = False
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "rate_limit" in msg:
+                warnings.append(
+                    f"第 {n}/{len(chunks)} 批起遇到 Groq 速率限制，其餘段落保留原文。"
+                    "稍後再試可完成整理。"
+                )
+                break
+            warnings.append(f"第 {n} 批整理失敗（{msg[:80]}），該批保留原文。")
+
+    return out, warnings
+
+
 def _style_run(run, size: int = DOCX_BD_PT, color: str = DOCX_BODY, bold: bool = False):
     from docx.oxml.ns import qn
     from docx.shared import Pt, RGBColor
@@ -874,9 +1030,20 @@ def _style_run(run, size: int = DOCX_BD_PT, color: str = DOCX_BODY, bold: bool =
     run.font.size = Pt(size)
     run.font.bold = bold
     run.font.color.rgb = RGBColor.from_string(color)
-    # 中日韓字元要另外指定 eastAsia，否則 Word 會套自己的預設字型
-    run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), DOCX_FONT)
+    # 中日韓字元要另外指定 eastAsia：Arial 沒有中文字符，
+    # 不指定的話中文會退回 Word 預設字型（通常是新細明體）
+    run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), DOCX_FONT_EA)
     return run
+
+
+def _cjk_num(n: int) -> str:
+    """1→一、10→十、11→十一（會議紀錄的小節編號用不到 100 以上）。"""
+    if n <= 10:
+        return _CJK_NUM[n - 1]
+    if n < 20:
+        return "十" + _CJK_NUM[n - 11]
+    tens, ones = divmod(n, 10)
+    return _CJK_NUM[tens - 1] + "十" + (_CJK_NUM[ones - 1] if ones else "")
 
 
 def _add_bottom_border(paragraph):
@@ -895,8 +1062,14 @@ def _add_bottom_border(paragraph):
 
 
 def build_minutes_docx(title: str, date: str, sections: list[dict],
-                       entries: list[dict], include_transcript: bool = True) -> bytes:
-    """依 skill 的樣式規範產生 .docx，回傳 bytes。"""
+                       entries: list[dict], include_transcript: bool = True,
+                       source_name: str = "", transcript_note: str = "") -> bytes:
+    """依 skill 的樣式規範產生 .docx，回傳 bytes。
+
+    版面規格對齊既有的人工整理成果（訪談/必佳訪視_會議紀錄.docx）：
+    標題 22pt、H1 18pt 加底線、H2 14pt、正文 12pt，
+    H1 自動編號「1. 」、H2 自動編號「一、」。
+    """
     from docx import Document
     from docx.shared import Cm, Inches, Pt
 
@@ -912,21 +1085,21 @@ def build_minutes_docx(title: str, date: str, sections: list[dict],
 
     def h1(text: str):
         p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(16)
-        p.paragraph_format.space_after  = Pt(6)
+        p.paragraph_format.space_before = Pt(18)
+        p.paragraph_format.space_after  = Pt(8)
         _style_run(p.add_run(text), DOCX_H1_PT, DOCX_TEAL, bold=True)
         _add_bottom_border(p)
 
     def h2(text: str):
         p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(10)
-        p.paragraph_format.space_after  = Pt(3)
+        p.paragraph_format.space_before = Pt(12)
+        p.paragraph_format.space_after  = Pt(4)
         _style_run(p.add_run(text), DOCX_H2_PT, DOCX_TEAL, bold=True)
 
-    def body(text: str):
+    def body(text: str, size: int = DOCX_BD_PT, color: str = DOCX_BODY):
         p = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(4)
-        _style_run(p.add_run(text))
+        _style_run(p.add_run(text), size, color)
 
     def bullet(text: str):
         # 用 numbering 樣式產生項目符號，不手動插入「‧」
@@ -934,38 +1107,46 @@ def build_minutes_docx(title: str, date: str, sections: list[dict],
         p.paragraph_format.space_after = Pt(2)
         _style_run(p.add_run(text))
 
-    # 標題區
+    # ── 標題區 ────────────────────────────────────────────────────────────
+    head = (title or "會議").strip()
+    if not head.endswith("會議紀錄"):
+        head = f"{head} 會議紀錄"
     title_p = doc.add_paragraph()
-    title_p.paragraph_format.space_after = Pt(2)
-    _style_run(title_p.add_run(title or "會議紀錄"), 20, DOCX_TEAL, bold=True)
-    if date:
-        meta = doc.add_paragraph()
-        meta.paragraph_format.space_after = Pt(2)
-        _style_run(meta.add_run(f"日期：{date}"), 10, "6B7280")
-    speakers = list(dict.fromkeys(e["speaker"] for e in entries if e["speaker"]))
-    if speakers:
-        meta2 = doc.add_paragraph()
-        _style_run(meta2.add_run("與會者：" + "、".join(speakers)), 10, "6B7280")
+    title_p.paragraph_format.space_after = Pt(4)
+    _style_run(title_p.add_run(head), DOCX_TITLE_PT, DOCX_TEAL, bold=True)
+    _add_bottom_border(title_p)
 
-    # AI 產生的各段落
-    for s in sections:
-        h1(str(s.get("heading", "")).lstrip("# ").strip() or "——")
+    meta = f"會議日期：{date}" if date else "會議日期：（未於逐字稿中提及）"
+    meta += "　｜　時間／地點／主席：（未於逐字稿中提及）"
+    if source_name:
+        meta += f"　｜　來源檔案：{source_name}"
+    body(meta, DOCX_META_PT)
+
+    # ── 各段落（H1 依序編號，H2 於每個 H1 內重新編號）────────────────────
+    for n, s in enumerate(sections, 1):
+        raw_head = _NUM_PREFIX_RE.sub("", str(s.get("heading", "")).lstrip("# ").strip())
+        h1(f"{n}. {raw_head or '——'}")
+        sub = 0
         for blk in s.get("blocks", []):
             btype = blk.get("type", "p")
             if btype == "h2":
-                h2(str(blk.get("text", "")).lstrip("# ").strip())
+                sub += 1
+                t = _NUM_PREFIX_RE.sub("", str(blk.get("text", "")).lstrip("# ").strip())
+                h2(f"{_cjk_num(sub)}、{t}")
             elif btype == "bullets":
                 for item in blk.get("items", []):
                     bullet(str(item).lstrip("-• ").strip())
             else:
                 body(str(blk.get("text", "")).strip())
 
-    # Transcript：完整逐字稿，由程式填入，不經過 LLM
+    # ── Transcript：完整逐字稿，不經 LLM 摘要 ─────────────────────────────
     if include_transcript:
-        h1("Transcript")
+        h1(f"{len(sections) + 1}. Transcript")
+        if transcript_note:
+            body(transcript_note, DOCX_META_PT)
         for e in entries:
             p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(3)
+            p.paragraph_format.space_after = Pt(6)
             # 續段（同一位發言者被拆成多段）不重複印名字
             if e["speaker"] and not e.get("cont"):
                 _style_run(p.add_run(f"{e['speaker']}："), DOCX_BD_PT, DOCX_TEAL, bold=True)
@@ -1241,6 +1422,17 @@ with tab_docx:
             use_ai = st.checkbox("以 AI 整理摘要／行動事項（需 Groq API Key）", value=True)
         with c_o2:
             keep_tr = st.checkbox("附上完整逐字稿（Transcript）", value=True)
+        polish = st.checkbox(
+            "並整理逐字稿內容（補標點、標記錯字、分辨發言者角色）",
+            value=False, disabled=not (use_ai and keep_tr),
+        )
+        if polish:
+            n_batch = max(1, -(-ai_chars // POLISH_CHUNK_CHARS))
+            st.caption(
+                f"逐字稿會分 {n_batch} 批送出，受 Groq 免費方案速率限制（12,000 TPM）"
+                f"約需 {max(1, n_batch // 3)}–{n_batch // 2 + 1} 分鐘。"
+                "任何一批失敗都會保留該批原文，不會少內容。"
+            )
 
         if st.button("產生 Word →", type="primary", key="docx_go"):
             if not txt_entries:
@@ -1264,9 +1456,28 @@ with tab_docx:
                                 {"title": docx_title, "date": docx_date.strftime("%Y/%m/%d")},
                                 groq_key, tpl_text,
                             )["sections"]
+                    doc_entries, note = txt_entries, ""
+                    if polish and use_ai and keep_tr:
+                        pbar = st.progress(0.0, text="整理逐字稿中…")
+
+                        def _tick(i, total, extra=""):
+                            pbar.progress(i / total, text=f"整理逐字稿：第 {i}/{total} 批{extra}")
+
+                        try:
+                            doc_entries, warns = polish_transcript(
+                                txt_entries, groq_key, docx_title, on_progress=_tick
+                            )
+                        finally:
+                            pbar.empty()
+                        for w in warns:
+                            st.warning(w)
+                        note = ("說明：以下逐字稿已由 AI 補上標點、修正明顯的語音辨識錯字"
+                                "（標記【原文：…】）並依語意標註發言者角色，內容未經刪減。")
+
                     st.session_state["docx_bytes"] = build_minutes_docx(
                         docx_title, docx_date.strftime("%Y/%m/%d"),
-                        sections, txt_entries, include_transcript=keep_tr,
+                        sections, doc_entries, include_transcript=keep_tr,
+                        source_name=up_txt.name, transcript_note=note,
                     )
                     st.session_state["docx_name"] = minutes_filename(
                         docx_title, docx_date.strftime("%Y%m%d")
