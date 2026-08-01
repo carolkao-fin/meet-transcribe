@@ -531,6 +531,62 @@ def parse_transcript_txt(text: str) -> list[dict]:
     return entries
 
 
+_SENT_END  = "。！？!?；;…"
+_PUNCT_END = _SENT_END + "，,、：:"
+
+
+def _join_text(a: str, b: str) -> str:
+    """接兩段語音片段。
+
+    Whisper 中文輸出常整份沒有標點，直接黏起來會變成幾百字讀不動的字串。
+    這裡在片段之間留一個空白標示停頓——不自行補逗號句號，
+    因為斷句會改變語意，那是發言者的話，不該由工具代為決定。
+    """
+    if not a:
+        return b
+    return a + b if a[-1] in _PUNCT_END else f"{a} {b}"
+
+
+def merge_segments(entries: list[dict], max_chars: int = 250) -> list[dict]:
+    """把連續同一發言者的短句合併成段落。
+
+    Whisper 逐字稿是一句一行（例如本專案「下載逐字稿」的輸出），
+    直接寫進 Word 會變成幾百個各掛一次發言者名稱的單句段落，
+    送進 LLM 時重複的前綴也會吃掉大量 token。
+
+    段落長度以 max_chars 為目標，但**只在原始行的邊界斷開**——那是 Whisper 的
+    語音停頓點，從那裡斷不會切在句子中間。有句末標點時優先在標點處收段。
+    Whisper 中文輸出常整份沒有標點，所以不能只靠標點切。
+    續段的 `cont=True`，輸出時不重複印發言者名稱。
+    """
+    turns: list[dict] = []
+    for e in entries:
+        if turns and turns[-1]["speaker"] == e["speaker"]:
+            turns[-1]["parts"].append(e["text"])
+        else:
+            turns.append({"speaker": e["speaker"], "parts": [e["text"]]})
+
+    out: list[dict] = []
+    for turn in turns:
+        para, first = "", True
+
+        def flush(nonlocal_para: str, is_first: bool):
+            out.append({"speaker": turn["speaker"], "text": nonlocal_para.strip(),
+                        "cont": not is_first})
+
+        for part in turn["parts"]:
+            too_long   = para and len(para) + len(part) > max_chars
+            sentence_e = para and para[-1] in _SENT_END and len(para) >= max_chars * 0.6
+            if too_long or sentence_e:
+                flush(para, first)
+                para, first = part, False
+            else:
+                para = _join_text(para, part)
+        if para.strip():
+            flush(para, first)
+    return out
+
+
 def read_template_text(upload) -> str:
     """讀取使用者上傳的格式模板（.txt / .md / .docx），回傳純文字結構描述。"""
     # UploadedFile 跨 rerun 是同一個物件，用 getvalue() 才不會受讀取位置影響
@@ -559,7 +615,8 @@ def generate_minutes(entries: list[dict], info: dict, groq_key: str,
     client = Groq(api_key=groq_key)
 
     txt = "\n".join(
-        f"{e['speaker']}: {e['text']}" if e["speaker"] else e["text"] for e in entries
+        f"{e['speaker']}: {e['text']}" if e["speaker"] and not e.get("cont") else e["text"]
+        for e in entries
     )
     truncated = False
     if len(txt) > MAX_TRANSCRIPT_CHARS:
@@ -734,7 +791,8 @@ def build_minutes_docx(title: str, date: str, sections: list[dict],
         for e in entries:
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(3)
-            if e["speaker"]:
+            # 續段（同一位發言者被拆成多段）不重複印名字
+            if e["speaker"] and not e.get("cont"):
                 _style_run(p.add_run(f"{e['speaker']}："), DOCX_BD_PT, DOCX_TEAL, bold=True)
             _style_run(p.add_run(e["text"]))
 
@@ -959,17 +1017,30 @@ with tab_docx:
             st.session_state["docx_bytes"]       = None
 
         txt_content = _decode_text(up_txt.getvalue())
-        txt_entries = parse_transcript_txt(txt_content)
+        raw_entries = parse_transcript_txt(txt_content)
+        # Whisper 逐字稿一句一行，先合併成段落再輸出／送 AI
+        txt_entries = merge_segments(raw_entries)
         n_spk = len({e["speaker"] for e in txt_entries if e["speaker"]})
+        ai_chars = len("\n".join(
+            f"{e['speaker']}: {e['text']}" if e["speaker"] and not e.get("cont") else e["text"]
+            for e in txt_entries
+        ))
         st.caption(
-            f"已讀取 {len(txt_entries)} 段、{len(txt_content):,} 字元"
+            f"已讀取 {len(raw_entries)} 句 → 合併為 {len(txt_entries)} 段"
             f"　｜　辨識到 {n_spk} 位發言者"
+            f"　｜　送 AI 約 {ai_chars:,} 字元"
             + ("（未偵測到「發言者：」格式，將以純段落輸出）" if n_spk == 0 else "")
         )
-        with st.expander("預覽解析結果（前 10 段）"):
-            for e in txt_entries[:10]:
+        if n_spk == 1:
+            st.caption(
+                "ℹ️ 只偵測到一位發言者——Whisper 不做語者分離，"
+                "整份逐字稿會標成同一人。若要區分發言者，請先在 .txt 中改好名稱再上傳。"
+            )
+        with st.expander("預覽解析結果（前 5 段）"):
+            for e in txt_entries[:5]:
                 st.markdown(
-                    f'<div class="tr-row"><span class="tr-spk">{e["speaker"] or "—"}</span>'
+                    f'<div class="tr-row"><span class="tr-spk">'
+                    f'{"" if e.get("cont") else (e["speaker"] or "—")}</span>'
                     f'<span>{e["text"]}</span></div>',
                     unsafe_allow_html=True,
                 )
@@ -1006,9 +1077,9 @@ with tab_docx:
                     tpl_text = read_template_text(up_tpl) if up_tpl else None
                     sections = []
                     if use_ai:
-                        if len(txt_content) > MAX_TRANSCRIPT_CHARS:
+                        if ai_chars > MAX_TRANSCRIPT_CHARS:
                             st.warning(
-                                f"⚠️ 逐字稿共 {len(txt_content):,} 字元，超過 Groq 免費方案上限"
+                                f"⚠️ 逐字稿共 {ai_chars:,} 字元，超過 Groq 免費方案上限"
                                 f"（{MAX_TRANSCRIPT_CHARS:,} 字元），摘要將只依首尾片段整理；"
                                 "Transcript 區塊仍為完整內容。"
                             )
