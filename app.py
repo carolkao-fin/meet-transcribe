@@ -657,7 +657,8 @@ def generate_minutes(entries: list[dict], info: dict, groq_key: str,
 逐字稿：
 {txt}
 
-只回傳一個合法的 JSON 物件，不要包含 markdown 或其他文字：
+只回傳一個合法的 JSON 物件，最外層必須正好是 {{"sections": [...]}}，
+不要包含 markdown、說明文字，也不要用其他鍵名包住 sections：
 
 {{
   "sections": [
@@ -674,21 +675,195 @@ def generate_minutes(entries: list[dict], info: dict, groq_key: str,
 
 輸出語言：繁體中文（台灣慣用語）；若逐字稿為英文則以英文輸出。"""
 
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=2048,
-        temperature=0.2,
+    last_raw = ""
+    for attempt in range(2):
+        msgs = [{"role": "user", "content": prompt}]
+        if attempt:        # 第一次形狀不對，把它自己的輸出貼回去要求改正
+            msgs += [
+                {"role": "assistant", "content": last_raw[:2000]},
+                {"role": "user", "content":
+                    "格式不對。請只回傳 {\"sections\": [{\"heading\": ..., \"blocks\": [...]}]}，"
+                    "最外層鍵名必須是 sections，內容不變。"},
+            ]
+        resp = _chat_json(client, msgs)
+        last_raw = (resp.choices[0].message.content or "").strip()
+        if getattr(resp.choices[0], "finish_reason", "") == "length":
+            raise ValueError(
+                "AI 回應在寫到一半時達到長度上限，內容不完整。"
+                "請縮短逐字稿，或取消勾選 AI 整理只做格式轉檔。"
+            )
+        try:
+            sections = _normalize_sections(json.loads(_extract_json(last_raw)))
+            if sections:
+                return {"sections": sections}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+    raise ValueError(
+        "AI 連續兩次都沒有回傳可用的結構，這通常是模型當下不穩定，重試一次多半就好。"
+        "若持續失敗，可取消勾選 AI 整理只做格式轉檔。\n\n"
+        f"模型實際回傳的開頭：\n{last_raw[:400] or '（空白）'}"
     )
-    text = resp.choices[0].message.content.strip()
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0].strip()
-    elif text.startswith("```"):
-        text = text.split("```")[1].split("```")[0].strip()
-    data = json.loads(text)
-    if not isinstance(data.get("sections"), list):
-        raise ValueError("AI 回傳的格式不符預期（缺少 sections）")
-    return data
+
+
+def _chat_json(client, messages):
+    """呼叫 Groq 並要求 JSON 輸出；舊模型不支援 response_format 時自動退回一般模式。"""
+    kwargs = dict(model=CHAT_MODEL, messages=messages, max_tokens=2048, temperature=0.2)
+    try:
+        return client.chat.completions.create(response_format={"type": "json_object"}, **kwargs)
+    except Exception as e:
+        if "response_format" not in str(e) and "json_object" not in str(e):
+            raise
+        return client.chat.completions.create(**kwargs)
+
+
+def _extract_json(text: str) -> str:
+    """從模型輸出中取出 JSON：去掉 code fence，再抓第一個完整的 {...} 或 [...]。"""
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts[1:]:
+            body = part[4:] if part.lower().startswith("json") else part
+            if body.strip().startswith(("{", "[")):
+                text = body
+                break
+    text = text.strip()
+    start = min((i for i in (text.find("{"), text.find("[")) if i >= 0), default=-1)
+    if start < 0:
+        return text
+    opener = text[start]
+    closer = "}" if opener == "{" else "]"
+    depth, in_str, esc = 0, False, False
+    for i, ch in enumerate(text[start:], start):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text[start:]
+
+
+# 這些鍵是會議metadata，不是段落，轉換時要跳過
+_META_KEYS = {"title", "date", "meeting_title", "meeting_date", "meeting", "標題", "日期", "會議標題"}
+
+
+def _item_text(item) -> str:
+    """條列項目可能是字串，也可能是 {assignee, task, due} 之類的物件。"""
+    if isinstance(item, str):
+        return item.lstrip("-• ").strip()
+    if isinstance(item, dict):
+        who  = item.get("assignee") or item.get("owner") or item.get("負責人") or ""
+        task = item.get("task") or item.get("text") or item.get("item") or item.get("事項") or ""
+        due  = item.get("due") or item.get("deadline") or item.get("期限") or ""
+        if who or task:
+            s = f"【{who}】{task}" if who else str(task)
+            return f"{s}（期限：{due}）" if due else s
+        return "；".join(f"{k}：{v}" for k, v in item.items() if v)
+    return str(item)
+
+
+def _norm_blocks(raw) -> list[dict]:
+    """把各種可能的 blocks 形狀正規化成 h2 / p / bullets。"""
+    if raw is None or raw == "":
+        return []
+    if isinstance(raw, str):
+        return [{"type": "p", "text": raw.strip()}]
+    if isinstance(raw, dict):
+        if any(k in raw for k in ("type", "text", "items", "bullets")):
+            raw = [raw]
+        else:                       # {小標題: 內容} 的對應表
+            out = []
+            for k, v in raw.items():
+                out.append({"type": "h2", "text": str(k)})
+                out += _norm_blocks(v)
+            return out
+    if not isinstance(raw, list):
+        return [{"type": "p", "text": str(raw)}]
+    if raw and all(isinstance(b, str) for b in raw):
+        return [{"type": "bullets", "items": [_item_text(b) for b in raw]}]
+
+    out: list[dict] = []
+    for b in raw:
+        if isinstance(b, str):
+            out.append({"type": "p", "text": b.strip()})
+            continue
+        if not isinstance(b, dict):
+            out.append({"type": "p", "text": str(b)})
+            continue
+        btype = str(b.get("type", "")).lower()
+        items = b.get("items") or b.get("bullets")
+        if btype in ("h2", "h3", "heading", "subheading") or (b.get("heading") and not b.get("text")):
+            out.append({"type": "h2", "text": str(b.get("text") or b.get("heading")).lstrip("# ")})
+        elif isinstance(items, list):
+            if b.get("text"):
+                out.append({"type": "p", "text": str(b["text"])})
+            out.append({"type": "bullets", "items": [_item_text(i) for i in items]})
+        elif "text" in b:
+            out.append({"type": "p", "text": str(b["text"])})
+        else:
+            out += _norm_blocks({k: v for k, v in b.items() if k != "type"})
+    return out
+
+
+def _normalize_sections(data) -> list[dict]:
+    """接受模型各種常見回傳形狀，統一成 [{"heading", "blocks"}]。
+
+    Llama 不見得會照著 sections 這個鍵名回，實際看過的形狀包括：
+    直接回陣列、包在別的鍵名底下、或用 {段落標題: 內容} 的對應表。
+    """
+    if isinstance(data, list):
+        raw_sections = data
+    elif isinstance(data, dict):
+        if isinstance(data.get("sections"), list):
+            raw_sections = data["sections"]
+        else:
+            nested = next(
+                (v for v in data.values()
+                 if isinstance(v, list) and v and isinstance(v[0], dict)
+                 and ({"heading", "blocks", "title", "content"} & set(v[0]))),
+                None,
+            )
+            if nested is not None:
+                raw_sections = nested
+            elif len(data) == 1 and isinstance(next(iter(data.values())), dict):
+                return _normalize_sections(next(iter(data.values())))
+            else:   # {段落標題: 內容} 的對應表
+                raw_sections = [
+                    {"heading": k, "blocks": v}
+                    for k, v in data.items()
+                    if str(k).lower() not in _META_KEYS
+                ]
+    else:
+        return []
+
+    out: list[dict] = []
+    for s in raw_sections:
+        if not isinstance(s, dict):
+            continue
+        heading = (s.get("heading") or s.get("title") or s.get("name")
+                   or s.get("section") or s.get("段落") or "")
+        body = None
+        for key in ("blocks", "content", "body", "sections", "內容"):
+            if key in s:
+                body = s[key]
+                break
+        if body is None:
+            body = {k: v for k, v in s.items()
+                    if k not in ("heading", "title", "name", "section", "段落")}
+        blocks = _norm_blocks(body)
+        if heading or blocks:
+            out.append({"heading": str(heading).lstrip("# ").strip() or "——", "blocks": blocks})
+    return out
 
 
 def _style_run(run, size: int = DOCX_BD_PT, color: str = DOCX_BODY, bold: bool = False):
