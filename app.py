@@ -4,8 +4,10 @@ MeetTranscribe — Streamlit 版（使用 Groq，完全免費）
 """
 
 import base64
+import io
 import json
 import os
+import re
 import subprocess
 import tempfile
 from datetime import datetime
@@ -89,6 +91,9 @@ for k, v in {
     "current_record_id": None,
     "_last_uploaded":    "",
     "_history_loaded":   False,
+    "_last_txt_upload":  "",
+    "docx_bytes":        None,
+    "docx_name":         "會議紀錄.docx",
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -145,6 +150,17 @@ CHAT_MODEL    = "llama-3.3-70b-versatile"
 # 中文約 1.5 chars/token → 安全字元上限取 12,000 chars
 MAX_TRANSCRIPT_CHARS = 12_000
 
+# ── 會議紀錄 .docx 樣式（對應「會議行動轉譯官」skill 的 SeaSalt.AI 規範）──────
+DOCX_TEAL  = "00897B"      # 主色
+DOCX_BODY  = "212121"      # 正文色
+DOCX_FONT  = "Arial"
+DOCX_H1_PT = 16
+DOCX_H2_PT = 13
+DOCX_BD_PT = 12            # body
+
+# 預設五段結構；Transcript 由程式填入完整逐字稿，不交給 LLM 產生
+DEFAULT_SECTIONS = ["Meeting Summary", "Topics", "Action Items", "Notes"]
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def secs_hms(s: float) -> str:
     s = int(s)
@@ -153,7 +169,6 @@ def secs_hms(s: float) -> str:
 
 def _friendly_error(e: Exception) -> str:
     """將 Groq API 錯誤轉成友善的中文訊息。"""
-    import re
     msg = str(e)
     # 429 rate limit
     if "429" in msg or "rate_limit_exceeded" in msg:
@@ -472,6 +487,268 @@ def plain_text(data: dict, info: dict, transcript: list) -> str:
     return "\n".join(lines)
 
 
+# ── 逐字稿 .txt → 會議紀錄 .docx ────────────────────────────────────────────────
+def _decode_text(raw: bytes) -> str:
+    """逐字稿多半是 UTF-8，但 Windows 記事本另存可能是 CP950（Big5）。"""
+    for enc in ("utf-8-sig", "utf-8", "cp950"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
+# 「speaker_1: 內容」「王小明：內容」，行首可有 [00:01:23] 之類的時間戳
+_SPK_RE = re.compile(
+    r"^\s*(?:[\[(]?\d{1,2}:\d{2}(?::\d{2})?[\])]?\s*)?([^：:\n]{1,24})[：:]\s*(.+)$"
+)
+_TIME_ONLY_RE = re.compile(r"^\s*[\[(]?\d{1,2}:\d{2}(?::\d{2})?[\])]?\s*")
+
+
+def parse_transcript_txt(text: str) -> list[dict]:
+    """把純文字逐字稿拆成 [{"speaker","text"}]。
+
+    - 「發言者：內容」開新的一段，行首時間戳會被去掉
+    - 緊接的斷行視為同一段的折行，併入前一段
+    - 空行結束該段；空行後沒有發言者標記的內容自成一段（speaker 留空），
+      不沿用上一位發言者，避免把話算到錯的人身上
+    """
+    entries: list[dict] = []
+    after_blank = True
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            after_blank = True
+            continue
+        m = _SPK_RE.match(line)
+        if m:
+            entries.append({"speaker": m.group(1).strip(), "text": m.group(2).strip()})
+        elif entries and not after_blank:
+            entries[-1]["text"] += " " + _TIME_ONLY_RE.sub("", line)
+        else:
+            entries.append({"speaker": "", "text": _TIME_ONLY_RE.sub("", line)})
+        after_blank = False
+    return entries
+
+
+def read_template_text(upload) -> str:
+    """讀取使用者上傳的格式模板（.txt / .md / .docx），回傳純文字結構描述。"""
+    # UploadedFile 跨 rerun 是同一個物件，用 getvalue() 才不會受讀取位置影響
+    raw = upload.getvalue()
+    if Path(upload.name).suffix.lower() == ".docx":
+        from docx import Document
+        doc = Document(io.BytesIO(raw))
+        parts = [p.text for p in doc.paragraphs if p.text.strip()]
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        return "\n".join(parts)
+    return _decode_text(raw)
+
+
+def generate_minutes(entries: list[dict], info: dict, groq_key: str,
+                     template_text: str | None = None) -> dict:
+    """用 Groq Llama 依「忠實還原」原則產生會議紀錄各段落。
+
+    回傳 {"sections": [{"heading": str, "blocks": [...]}]}；
+    blocks 的 type 為 h2 / p / bullets。Transcript 不在此產生。
+    """
+    from groq import Groq
+    client = Groq(api_key=groq_key)
+
+    txt = "\n".join(
+        f"{e['speaker']}: {e['text']}" if e["speaker"] else e["text"] for e in entries
+    )
+    truncated = False
+    if len(txt) > MAX_TRANSCRIPT_CHARS:
+        keep_head = int(MAX_TRANSCRIPT_CHARS * 0.67)
+        keep_tail = MAX_TRANSCRIPT_CHARS - keep_head
+        txt = txt[:keep_head] + "\n\n… [逐字稿過長，中間部分已略去] …\n\n" + txt[-keep_tail:]
+        truncated = True
+
+    if template_text:
+        fmt_rule = (
+            "請嚴格依照下列使用者提供的格式模板決定段落標題與欄位順序，"
+            "不得自行新增模板以外的欄位；模板有欄位但逐字稿沒有對應資訊時，填入「——」。\n\n"
+            f"格式模板：\n{template_text[:3000]}"
+        )
+    else:
+        fmt_rule = (
+            "請採用以下四段結構（Transcript 由系統另外附上，你不需要輸出）：\n"
+            "1. Meeting Summary：依議題分節，每節一個 h2 小標題 + 1–2 句總結段落 + 條列各發言者論點\n"
+            "2. Topics：一段以逗號分隔的核心關鍵詞\n"
+            "3. Action Items：依任務群組分節，每組一個 h2 小標題 + 1 句說明 + "
+            "條列「【負責人】具體任務（期限：如有）」\n"
+            "4. Notes：語音辨識錯字標記、雜訊段落、人名／單位不確定項目等"
+        )
+
+    prompt = f"""你是一名「會議行動轉譯官」，負責把會議逐字稿轉為正式會議紀錄。
+
+最高原則是**忠實還原**：只呈現逐字稿中實際出現的資訊。
+禁止新增未提及的決議或行動事項、禁止靠邏輯推斷補充內容、禁止更改任何人的立場或結論。
+逐字稿無對應資訊的欄位，一律填「——」，不得捏造。
+{"（注意：逐字稿因過長已截取首尾，請就現有內容整理，不要臆測被略去的部分。）" if truncated else ""}
+
+會議資訊：
+- 標題：{info.get("title", "未命名會議")}
+- 日期：{info.get("date", "")}
+
+{fmt_rule}
+
+逐字稿：
+{txt}
+
+只回傳一個合法的 JSON 物件，不要包含 markdown 或其他文字：
+
+{{
+  "sections": [
+    {{
+      "heading": "段落標題",
+      "blocks": [
+        {{"type": "h2", "text": "小節標題"}},
+        {{"type": "p", "text": "段落文字"}},
+        {{"type": "bullets", "items": ["條列項目1", "條列項目2"]}}
+      ]
+    }}
+  ]
+}}
+
+輸出語言：繁體中文（台灣慣用語）；若逐字稿為英文則以英文輸出。"""
+
+    resp = client.chat.completions.create(
+        model=CHAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=2048,
+        temperature=0.2,
+    )
+    text = resp.choices[0].message.content.strip()
+    if "```json" in text:
+        text = text.split("```json")[1].split("```")[0].strip()
+    elif text.startswith("```"):
+        text = text.split("```")[1].split("```")[0].strip()
+    data = json.loads(text)
+    if not isinstance(data.get("sections"), list):
+        raise ValueError("AI 回傳的格式不符預期（缺少 sections）")
+    return data
+
+
+def _style_run(run, size: int = DOCX_BD_PT, color: str = DOCX_BODY, bold: bool = False):
+    from docx.oxml.ns import qn
+    from docx.shared import Pt, RGBColor
+
+    run.font.name = DOCX_FONT
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = RGBColor.from_string(color)
+    # 中日韓字元要另外指定 eastAsia，否則 Word 會套自己的預設字型
+    run._element.get_or_add_rPr().get_or_add_rFonts().set(qn("w:eastAsia"), DOCX_FONT)
+    return run
+
+
+def _add_bottom_border(paragraph):
+    """H1 標題下方的分隔線。"""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    pbdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "8")
+    bottom.set(qn("w:space"), "4")
+    bottom.set(qn("w:color"), DOCX_TEAL)
+    pbdr.append(bottom)
+    paragraph._p.get_or_add_pPr().append(pbdr)
+
+
+def build_minutes_docx(title: str, date: str, sections: list[dict],
+                       entries: list[dict], include_transcript: bool = True) -> bytes:
+    """依 skill 的樣式規範產生 .docx，回傳 bytes。"""
+    from docx import Document
+    from docx.shared import Cm, Inches, Pt
+
+    doc = Document()
+    sec = doc.sections[0]
+    sec.page_width, sec.page_height = Cm(21.0), Cm(29.7)          # A4
+    sec.top_margin = sec.bottom_margin = Inches(1)
+    sec.left_margin = sec.right_margin = Inches(1)
+
+    normal = doc.styles["Normal"]
+    normal.font.name = DOCX_FONT
+    normal.font.size = Pt(DOCX_BD_PT)
+
+    def h1(text: str):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(16)
+        p.paragraph_format.space_after  = Pt(6)
+        _style_run(p.add_run(text), DOCX_H1_PT, DOCX_TEAL, bold=True)
+        _add_bottom_border(p)
+
+    def h2(text: str):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_before = Pt(10)
+        p.paragraph_format.space_after  = Pt(3)
+        _style_run(p.add_run(text), DOCX_H2_PT, DOCX_TEAL, bold=True)
+
+    def body(text: str):
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(4)
+        _style_run(p.add_run(text))
+
+    def bullet(text: str):
+        # 用 numbering 樣式產生項目符號，不手動插入「‧」
+        p = doc.add_paragraph(style="List Bullet")
+        p.paragraph_format.space_after = Pt(2)
+        _style_run(p.add_run(text))
+
+    # 標題區
+    title_p = doc.add_paragraph()
+    title_p.paragraph_format.space_after = Pt(2)
+    _style_run(title_p.add_run(title or "會議紀錄"), 20, DOCX_TEAL, bold=True)
+    if date:
+        meta = doc.add_paragraph()
+        meta.paragraph_format.space_after = Pt(2)
+        _style_run(meta.add_run(f"日期：{date}"), 10, "6B7280")
+    speakers = list(dict.fromkeys(e["speaker"] for e in entries if e["speaker"]))
+    if speakers:
+        meta2 = doc.add_paragraph()
+        _style_run(meta2.add_run("與會者：" + "、".join(speakers)), 10, "6B7280")
+
+    # AI 產生的各段落
+    for s in sections:
+        h1(str(s.get("heading", "")).lstrip("# ").strip() or "——")
+        for blk in s.get("blocks", []):
+            btype = blk.get("type", "p")
+            if btype == "h2":
+                h2(str(blk.get("text", "")).lstrip("# ").strip())
+            elif btype == "bullets":
+                for item in blk.get("items", []):
+                    bullet(str(item).lstrip("-• ").strip())
+            else:
+                body(str(blk.get("text", "")).strip())
+
+    # Transcript：完整逐字稿，由程式填入，不經過 LLM
+    if include_transcript:
+        h1("Transcript")
+        for e in entries:
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(3)
+            if e["speaker"]:
+                _style_run(p.add_run(f"{e['speaker']}："), DOCX_BD_PT, DOCX_TEAL, bold=True)
+            _style_run(p.add_run(e["text"]))
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def minutes_filename(title: str, date_str: str = "") -> str:
+    """{會議主題}_{YYYYMMDD}_會議紀錄.docx；無日期則省略日期段。"""
+    safe = re.sub(r'[\\/:*?"<>|]', "_", (title or "會議紀錄").strip()).replace(" ", "_")
+    return f"{safe}_{date_str}_會議紀錄.docx" if date_str else f"{safe}_會議紀錄.docx"
+
+
 def render_results(data: dict, info: dict, transcript: list, key_prefix: str = "main",
                    audio_bytes: bytes | None = None, audio_filename: str = "recording") -> None:
     participants = info.get("participants", [])
@@ -571,7 +848,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Tabs ───────────────────────────────────────────────────────────────────────
-tab_up, tab_rec, tab_hist = st.tabs(["📁 上傳音檔", "🎤 即時錄音", "📚 歷史記錄"])
+tab_up, tab_rec, tab_docx, tab_hist = st.tabs(
+    ["📁 上傳音檔", "🎤 即時錄音", "📄 逐字稿轉 Word", "📚 歷史記錄"]
+)
 
 # ── Tab 1: Upload ──────────────────────────────────────────────────────────────
 with tab_up:
@@ -663,7 +942,107 @@ with tab_rec:
     except Exception:
         st.warning("即時錄音需要 Streamlit ≥ 1.31，請改用「上傳音檔」分頁。")
 
-# ── Tab 3: History ─────────────────────────────────────────────────────────────
+# ── Tab 3: 逐字稿 .txt → 會議紀錄 .docx ────────────────────────────────────────
+with tab_docx:
+    st.markdown(
+        "已經有轉好的逐字稿？直接上傳 **.txt**，依「會議行動轉譯官」格式產出 Word 會議紀錄。"
+    )
+    up_txt = st.file_uploader(
+        "上傳逐字稿 .txt", type=["txt"], key="txt_upload", label_visibility="collapsed"
+    )
+
+    if up_txt:
+        # 換檔時以檔名帶入標題；此處早於下方 widget 建立，可直接寫 session state
+        if st.session_state.get("_last_txt_upload") != up_txt.name:
+            st.session_state["_last_txt_upload"] = up_txt.name
+            st.session_state["docx_title_key"]   = Path(up_txt.name).stem
+            st.session_state["docx_bytes"]       = None
+
+        txt_content = _decode_text(up_txt.getvalue())
+        txt_entries = parse_transcript_txt(txt_content)
+        n_spk = len({e["speaker"] for e in txt_entries if e["speaker"]})
+        st.caption(
+            f"已讀取 {len(txt_entries)} 段、{len(txt_content):,} 字元"
+            f"　｜　辨識到 {n_spk} 位發言者"
+            + ("（未偵測到「發言者：」格式，將以純段落輸出）" if n_spk == 0 else "")
+        )
+        with st.expander("預覽解析結果（前 10 段）"):
+            for e in txt_entries[:10]:
+                st.markdown(
+                    f'<div class="tr-row"><span class="tr-spk">{e["speaker"] or "—"}</span>'
+                    f'<span>{e["text"]}</span></div>',
+                    unsafe_allow_html=True,
+                )
+
+        c_t, c_d = st.columns([3, 2])
+        with c_t:
+            docx_title = st.text_input("會議標題", key="docx_title_key")
+        with c_d:
+            docx_date = st.date_input("會議日期", value=datetime.now())
+
+        st.markdown("**格式模板（選填）**")
+        st.caption(
+            "不上傳 → 採用預設五段結構（Meeting Summary / Topics / Action Items / Notes / "
+            "Transcript）。上傳 .txt、.md 或 .docx 範本 → 依範本的欄位與順序填寫。"
+        )
+        up_tpl = st.file_uploader(
+            "上傳格式模板", type=["txt", "md", "docx"], key="tpl_upload",
+            label_visibility="collapsed",
+        )
+
+        c_o1, c_o2 = st.columns(2)
+        with c_o1:
+            use_ai = st.checkbox("以 AI 整理摘要／行動事項（需 Groq API Key）", value=True)
+        with c_o2:
+            keep_tr = st.checkbox("附上完整逐字稿（Transcript）", value=True)
+
+        if st.button("產生 Word →", type="primary", key="docx_go"):
+            if not txt_entries:
+                st.error("這份 .txt 沒有可用內容。")
+            elif use_ai and not groq_key:
+                st.error("AI 整理需要 Groq API Key，請在左側輸入；或取消勾選只做格式轉檔。")
+            else:
+                try:
+                    tpl_text = read_template_text(up_tpl) if up_tpl else None
+                    sections = []
+                    if use_ai:
+                        if len(txt_content) > MAX_TRANSCRIPT_CHARS:
+                            st.warning(
+                                f"⚠️ 逐字稿共 {len(txt_content):,} 字元，超過 Groq 免費方案上限"
+                                f"（{MAX_TRANSCRIPT_CHARS:,} 字元），摘要將只依首尾片段整理；"
+                                "Transcript 區塊仍為完整內容。"
+                            )
+                        with st.spinner("Llama 整理會議紀錄中…"):
+                            sections = generate_minutes(
+                                txt_entries,
+                                {"title": docx_title, "date": docx_date.strftime("%Y/%m/%d")},
+                                groq_key, tpl_text,
+                            )["sections"]
+                    st.session_state["docx_bytes"] = build_minutes_docx(
+                        docx_title, docx_date.strftime("%Y/%m/%d"),
+                        sections, txt_entries, include_transcript=keep_tr,
+                    )
+                    st.session_state["docx_name"] = minutes_filename(
+                        docx_title, docx_date.strftime("%Y%m%d")
+                    )
+                    st.success("會議紀錄已產生，可於下方下載。")
+                except ModuleNotFoundError:
+                    st.error("缺少 python-docx 套件，請執行：pip install python-docx")
+                except json.JSONDecodeError:
+                    st.error("AI 回傳的內容不是合法 JSON，請再試一次，或取消 AI 整理只做格式轉檔。")
+                except Exception as e:
+                    st.error(_friendly_error(e))
+
+    if st.session_state.get("docx_bytes"):
+        st.download_button(
+            "⬇ 下載會議紀錄 (.docx)",
+            st.session_state["docx_bytes"],
+            st.session_state.get("docx_name", "會議紀錄.docx"),
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            type="primary", key="docx_dl",
+        )
+
+# ── Tab 4: History ─────────────────────────────────────────────────────────────
 with tab_hist:
     st.markdown("**載入過去儲存的 JSON 紀錄**")
     loaded_file = st.file_uploader("上傳 .json 檔案", type=["json"],
