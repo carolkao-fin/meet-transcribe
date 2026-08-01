@@ -1,6 +1,6 @@
 """
 MeetTranscribe — Streamlit 版（使用 Groq，完全免費）
-上傳音檔（最大 150 MB）→ Groq Whisper 轉錄 → 指定發言者 → Groq Llama 分析
+上傳音檔（最大 100 MB）→ Groq Whisper 轉錄 → 指定發言者 → Groq Llama 分析
 """
 
 import base64
@@ -318,7 +318,7 @@ def transcribe_audio(data: bytes, filename: str, groq_key: str, lc: str | None) 
     tmp_files = [tmp_path]
     try:
         # 先估時長：Groq 的額度是以音訊秒數計，跟檔案幾 MB 無關。
-        # 同樣 150 MB，320 kbps 約 1 小時沒問題，64 kbps 約 5 小時一定會中斷。
+        # 同樣 100 MB，320 kbps 約 43 分鐘沒問題，64 kbps 約 3.6 小時一定會中斷。
         dur = _audio_duration(tmp_path)
         if dur > GROQ_AUDIO_SEC_PER_HOUR:
             st.warning(
@@ -596,7 +596,7 @@ tab_up, tab_rec, tab_hist = st.tabs(["📁 上傳音檔", "🎤 即時錄音", "
 
 # ── Tab 1: Upload ──────────────────────────────────────────────────────────────
 with tab_up:
-    st.markdown("支援格式：**mp3 · wav · m4a · aac · ogg · flac · webm**　｜　最大 **150 MB**")
+    st.markdown("支援格式：**mp3 · wav · m4a · aac · ogg · flac · webm**　｜　最大 **100 MB**")
     uploaded = st.file_uploader(
         "拖曳音訊至此，或點擊選擇",
         type=["mp3", "wav", "m4a", "aac", "ogg", "flac", "webm"],
