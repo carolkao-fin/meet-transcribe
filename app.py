@@ -1,6 +1,6 @@
 """
 MeetTranscribe — Streamlit 版（使用 Groq，完全免費）
-上傳音檔（最大 100 MB）→ Groq Whisper 轉錄 → 指定發言者 → Groq Llama 分析
+上傳音檔（最大 200 MB）→ Groq Whisper 轉錄 → 指定發言者 → Groq Llama 分析
 """
 
 import base64
@@ -575,7 +575,7 @@ tab_up, tab_rec, tab_hist = st.tabs(["📁 上傳音檔", "🎤 即時錄音", "
 
 # ── Tab 1: Upload ──────────────────────────────────────────────────────────────
 with tab_up:
-    st.markdown("支援格式：**mp3 · wav · m4a · aac · ogg · flac · webm**　｜　最大 **100 MB**")
+    st.markdown("支援格式：**mp3 · wav · m4a · aac · ogg · flac · webm**　｜　最大 **200 MB**")
     uploaded = st.file_uploader(
         "拖曳音訊至此，或點擊選擇",
         type=["mp3", "wav", "m4a", "aac", "ogg", "flac", "webm"],
