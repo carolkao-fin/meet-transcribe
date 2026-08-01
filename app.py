@@ -1,6 +1,6 @@
 """
 MeetTranscribe — Streamlit 版（使用 Groq，完全免費）
-上傳音檔（最大 200 MB）→ Groq Whisper 轉錄 → 指定發言者 → Groq Llama 分析
+上傳音檔（最大 150 MB）→ Groq Whisper 轉錄 → 指定發言者 → Groq Llama 分析
 """
 
 import base64
@@ -139,6 +139,14 @@ GROQ_AUDIO_EXTS = {
     ".flac", ".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".ogg", ".opus", ".wav", ".webm",
 }
 CHAT_MODEL    = "llama-3.3-70b-versatile"
+
+# Groq 免費方案每小時可轉錄的音訊秒數；超過會回 429，需等額度恢復
+GROQ_AUDIO_SEC_PER_HOUR = 7_200
+
+# 超過這個大小的音訊不存進歷史記錄。Streamlit Cloud 每個 app 記憶體約 1 GB，
+# 而一個檔案在記憶體裡會有多份副本（上傳緩衝、read() 的 bytes、session state），
+# 大檔全部留著會把 app 撐爆——逐字稿與分析結果照常保留。
+HISTORY_AUDIO_MAX = 50 * 1_048_576      # 50 MB
 
 # Groq 免費方案 TPM 上限 ~12,000 tokens；
 # prompt 固定部分約 500 tokens，max_tokens=2048，故逐字稿最多保留 ~9,000 tokens。
@@ -309,6 +317,17 @@ def transcribe_audio(data: bytes, filename: str, groq_key: str, lc: str | None) 
 
     tmp_files = [tmp_path]
     try:
+        # 先估時長：Groq 的額度是以音訊秒數計，跟檔案幾 MB 無關。
+        # 同樣 150 MB，320 kbps 約 1 小時沒問題，64 kbps 約 5 小時一定會中斷。
+        dur = _audio_duration(tmp_path)
+        if dur > GROQ_AUDIO_SEC_PER_HOUR:
+            st.warning(
+                f"⏱ 這段音訊約 {dur/3600:.1f} 小時，超過 Groq 免費方案每小時 "
+                f"{GROQ_AUDIO_SEC_PER_HOUR:,} 秒（2 小時）的轉錄額度。\n\n"
+                "轉錄到約 2 小時處會出現 429 並中斷，已完成的段落不會保留。"
+                "建議先將錄音分割成 2 小時以內再上傳。"
+            )
+
         # Groq 不認識的容器（raw .aac 等）先轉成 mp3，否則會回 400 invalid media file
         if suffix not in GROQ_AUDIO_EXTS:
             if not _ffmpeg_ok():
@@ -421,7 +440,8 @@ def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> di
 
 
 def save_to_history(transcript, analysis, meeting_info, record_id=None,
-                    audio_bytes=None, audio_filename=None) -> str:
+                    audio_bytes=None, audio_filename=None,
+                    audio_skipped: bool = False) -> str:
     """新增或更新歷史記錄，回傳 record id。"""
     if record_id:
         for r in st.session_state.history:
@@ -445,6 +465,7 @@ def save_to_history(transcript, analysis, meeting_info, record_id=None,
         "meeting_info":   meeting_info,
         "audio_bytes":    audio_bytes,
         "audio_filename": audio_filename or "recording",
+        "audio_skipped":  audio_skipped,
     }
     st.session_state.history.insert(0, record)
     return record["id"]
@@ -575,7 +596,7 @@ tab_up, tab_rec, tab_hist = st.tabs(["📁 上傳音檔", "🎤 即時錄音", "
 
 # ── Tab 1: Upload ──────────────────────────────────────────────────────────────
 with tab_up:
-    st.markdown("支援格式：**mp3 · wav · m4a · aac · ogg · flac · webm**　｜　最大 **200 MB**")
+    st.markdown("支援格式：**mp3 · wav · m4a · aac · ogg · flac · webm**　｜　最大 **150 MB**")
     uploaded = st.file_uploader(
         "拖曳音訊至此，或點擊選擇",
         type=["mp3", "wav", "m4a", "aac", "ogg", "flac", "webm"],
@@ -613,11 +634,19 @@ with tab_up:
                         st.session_state.transcript        = entries
                         st.session_state.analysis          = None
                         st.session_state.meeting_info      = info
+                        # 大檔不留音訊，避免 Streamlit Cloud 記憶體被撐爆
+                        too_big = len(audio_data) > HISTORY_AUDIO_MAX
                         st.session_state.current_record_id = save_to_history(
                             entries, None, info,
-                            audio_bytes=audio_data, audio_filename=uploaded.name,
+                            audio_bytes=None if too_big else audio_data,
+                            audio_filename=uploaded.name,
+                            audio_skipped=too_big,
                         )
-                        st.success(f"轉錄完成！共 {len(segs)} 段，已自動儲存至歷史記錄。")
+                        st.success(
+                            f"轉錄完成！共 {len(segs)} 段，已自動儲存至歷史記錄。"
+                            + (f"（原始錄音 {len(audio_data)/1_048_576:.0f} MB 超過 "
+                               f"{HISTORY_AUDIO_MAX//1_048_576} MB，未存入歷史記錄）" if too_big else "")
+                        )
                         st.rerun()
                     except Exception as e:
                         st.error(_friendly_error(e))
@@ -652,9 +681,12 @@ with tab_rec:
                             st.session_state.transcript        = entries
                             st.session_state.analysis          = None
                             st.session_state.meeting_info      = info
+                            too_big = len(audio_data) > HISTORY_AUDIO_MAX
                             st.session_state.current_record_id = save_to_history(
                                 entries, None, info,
-                                audio_bytes=audio_data, audio_filename="recording.wav",
+                                audio_bytes=None if too_big else audio_data,
+                                audio_filename="recording.wav",
+                                audio_skipped=too_big,
                             )
                             st.success("轉錄完成！已自動儲存至歷史記錄。")
                             st.rerun()
@@ -717,6 +749,11 @@ with tab_hist:
                 rec = history[idx]
                 ab = rec.get("audio_bytes")
                 af = rec.get("audio_filename", "recording")
+                if not ab and rec.get("audio_skipped"):
+                    st.caption(
+                        f"🎵 原始錄音超過 {HISTORY_AUDIO_MAX//1_048_576} MB，未存入歷史記錄"
+                        "（逐字稿與分析結果不受影響）。"
+                    )
                 if rec["analysis"] is None:
                     st.info("📝 此記錄尚未進行 AI 分析，僅顯示逐字稿。")
                     info = rec["meeting_info"]
