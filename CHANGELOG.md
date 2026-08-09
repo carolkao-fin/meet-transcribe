@@ -2,6 +2,7 @@
 
 **專案**：MeetTranscribe — 免費 AI 會議轉錄與分析工具
 **部署**：https://meet-transcribe.streamlit.app
+**操作手冊**：https://claude.ai/code/artifact/39221198-5e11-4d5f-a739-d30b1cac141f — 圖解操作流程（申請 Groq API Key → 音檔轉逐字稿 → AI 整理成會議紀錄）
 **技術棧**：Streamlit · Groq Whisper · Groq Llama 3.3 70B · Python
 
 ---
