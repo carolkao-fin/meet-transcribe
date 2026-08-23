@@ -15,6 +15,9 @@ import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_javascript import st_javascript
 
+# 圖解操作手冊：申請 Groq API Key → 音檔轉逐字稿 → AI 整理成會議紀錄
+MANUAL_URL = "https://claude.ai/code/artifact/39221198-5e11-4d5f-a739-d30b1cac141f"
+
 # ── 頁面設定 ───────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="MeetTranscribe",
@@ -33,6 +36,9 @@ st.markdown("""
 }
 .hero h1 { color: white; margin: 0; font-size: 1.9rem; font-weight: 800; }
 .hero p  { color: rgba(255,255,255,.85); margin: .3rem 0 0; font-size: .95rem; }
+.hero .hero-link { margin-top: .55rem; font-size: .9rem; }
+.hero .hero-link a { color: #fff; font-weight: 700; text-decoration: underline; }
+.hero .hero-link a:hover { color: #d7f5f5; }
 .res-header {
     background: linear-gradient(135deg, #1BA8A8 0%, #138A8A 100%);
     color: white; border-radius: 12px;
@@ -531,6 +537,7 @@ def render_results(data: dict, info: dict, transcript: list, key_prefix: str = "
 with st.sidebar:
     st.markdown("## 🎙 MeetTranscribe")
     st.caption("智能會議轉錄 & AI 分析")
+    st.markdown(f"📖 **[操作手冊]({MANUAL_URL})** — 圖解操作流程")
     st.divider()
 
     with st.expander("🔑 API 金鑰", expanded=True):
@@ -563,10 +570,13 @@ with st.sidebar:
         st.rerun()
 
 # ── Hero ───────────────────────────────────────────────────────────────────────
-st.markdown("""
+st.markdown(f"""
 <div class="hero">
   <h1>🎙 MeetTranscribe</h1>
   <p>上傳音訊 · Groq Whisper 免費轉錄 · 指定發言者 · Llama AI 免費分析 · 一個 Key 搞定所有功能</p>
+  <p class="hero-link">📖 第一次使用？請看
+    <a href="{MANUAL_URL}" target="_blank" rel="noopener">操作手冊</a>
+    ——申請 Groq API Key → 音檔轉逐字稿 → AI 整理成會議紀錄</p>
 </div>
 """, unsafe_allow_html=True)
 
