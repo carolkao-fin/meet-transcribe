@@ -456,6 +456,13 @@ def save_to_history(transcript, analysis, meeting_info, record_id=None,
     return record["id"]
 
 
+def _fmt_entry(e: dict) -> str:
+    """將逐字稿 entry 格式化為帶時間軸標示的字串。"""
+    ts = e.get("displayTime")
+    prefix = f"[{ts}] " if ts else ""
+    return f"{prefix}{e['speaker']}: {e['text']}"
+
+
 def plain_text(data: dict, info: dict, transcript: list) -> str:
     lines = [
         info.get("title", "會議記錄"),
@@ -474,7 +481,7 @@ def plain_text(data: dict, info: dict, transcript: list) -> str:
         lines.append("")
     lines += ["Transcript", "=" * 40]
     src = data.get("corrected_transcript") or transcript
-    lines += [f"{e['speaker']}: {e['text']}" for e in src]
+    lines += [_fmt_entry(e) for e in src]
     return "\n".join(lines)
 
 
@@ -738,7 +745,7 @@ with tab_hist:
                     fname = info.get("title", "transcript").replace(" ", "_")
                     st.download_button(
                         "⬇ 下載逐字稿",
-                        "\n".join(f"{e['speaker']}: {e['text']}" for e in rec["transcript"]),
+                        "\n".join(_fmt_entry(e) for e in rec["transcript"]),
                         f"{fname}.txt", key=f"hist_{idx}_dl_txt_raw",
                     )
                     for e in rec["transcript"]:
@@ -780,7 +787,7 @@ if st.session_state.transcript:
     with c_dl:
         st.download_button(
             "⬇ 下載逐字稿",
-            "\n".join(f"{e['speaker']}: {e['text']}" for e in st.session_state.transcript),
+            "\n".join(_fmt_entry(e) for e in st.session_state.transcript),
             f"transcript_{datetime.now():%Y%m%d_%H%M}.txt",
             use_container_width=True,
         )
