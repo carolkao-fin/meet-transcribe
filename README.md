@@ -21,6 +21,7 @@
 
 - 支援語言：**自動偵測 / 中文 / 英文**
 - 逐段輸出，每段帶有精確的起始時間戳（`HH:MM:SS`）
+- 中文輸出自動轉換為**繁體中文**（opencc s2twp），並補上正確標點符號
 - 轉錄完成後自動存入瀏覽器歷史記錄
 
 ### 逐字稿編輯
@@ -40,7 +41,7 @@
 | **Action Items** | 依負責人分組的行動任務清單 |
 | **Corrected Transcript** | AI 修正後的逐字稿（術語、人名、公司名） |
 
-輸出語言：逐字稿含中文則輸出**繁體中文**，否則輸出**英文**。
+輸出語言：逐字稿含中文則輸出**繁體中文**（含 AI 修正逐字稿），否則輸出**英文**。
 
 ### 下載與匯出
 
@@ -118,6 +119,7 @@ streamlit run app.py
 | 分析模型 | `llama-3.3-70b-versatile`（Groq 託管） |
 | 前端框架 | Streamlit 1.31+ |
 | 音訊處理 | ffmpeg / ffprobe |
+| 中文轉換 | opencc-python-reimplemented（簡體→繁體，s2twp） |
 | 持久化儲存 | 瀏覽器 localStorage |
 
 ### Groq 免費方案限制
@@ -134,7 +136,13 @@ streamlit run app.py
 
 ## 更新紀錄
 
-請見 [CHANGELOG.md](CHANGELOG.md)。
+### v1.1.0（2026-11-10）
+- **繁體中文輸出**：Whisper 轉錄結果自動以 opencc s2twp 轉換為繁體中文（台灣用詞：軟體、網路、檔案⋯）
+- **標點符號修正**：Whisper prompt 引導輸出帶標點的繁體中文，不再輸出無標點連續文字
+- **AI 分析繁體化**：Llama 修正逐字稿（corrected_transcript）同樣要求繁體中文與標點符號
+
+### v1.0.0
+初始版本。
 
 ---
 
