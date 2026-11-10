@@ -7,6 +7,20 @@
 
 ---
 
+## v1.8 — 2026-11-10
+
+### 修正
+- **繁體中文輸出**：Whisper 轉錄結果改以 opencc s2twp 自動轉換為繁體中文（台灣慣用詞：軟體、網路、檔案、歐盟⋯），解決原本輸出簡體字的問題
+- **標點符號補全**：在 Whisper API 呼叫加入 `prompt="請使用繁體中文輸出，並加上正確的標點符號。"`，引導模型輸出帶標點的文字，不再輸出無標點連續文字串
+- **AI 修正逐字稿繁體化**：Llama 分析 prompt 明確要求 `corrected_transcript` 欄位使用繁體中文並加標點
+
+### 技術細節
+- 新增 opencc 初始化區塊（頂部）：使用 `opencc-python-reimplemented` 載入 `s2twp` 轉換器；import 失敗時 fallback 為原文，不影響運行
+- `_call_whisper`：依語言參數（`zh` 或 `None`）決定是否傳入 prompt；每段 segment 文字以 `_to_traditional()` 轉換後才存入結果
+- `requirements.txt` 新增 `opencc-python-reimplemented>=0.1.7`
+
+---
+
 ## v1.7 — 2026-11-02
 
 ### 新功能
