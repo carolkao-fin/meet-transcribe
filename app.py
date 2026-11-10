@@ -11,6 +11,15 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 
+try:
+    import opencc
+    _s2twp = opencc.OpenCC("s2twp")
+    def _to_traditional(text: str) -> str:
+        return _s2twp.convert(text)
+except Exception:
+    def _to_traditional(text: str) -> str:
+        return text
+
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_javascript import st_javascript
@@ -285,22 +294,26 @@ def _call_whisper(client, path: str, lc: str | None) -> list[dict]:
         raise ValueError(
             f"要送出的音訊只有 {size} bytes，內容為空或已損毀，已中止上傳。"
         )
+    _prompt = "請使用繁體中文輸出，並加上正確的標點符號。" if (lc == "zh" or lc is None) else None
     with open(path, "rb") as fh:
-        r = client.audio.transcriptions.create(
+        create_kwargs = dict(
             model=WHISPER_MODEL,
             file=fh,
             response_format="verbose_json",
             timestamp_granularities=["segment"],
             language=lc,
         )
+        if _prompt:
+            create_kwargs["prompt"] = _prompt
+        r = client.audio.transcriptions.create(**create_kwargs)
     out = []
     for s in getattr(r, "segments", None) or []:
         start = float(s["start"] if isinstance(s, dict) else s.start)
         text  = (s["text"]  if isinstance(s, dict) else getattr(s, "text", "") or "").strip()
         if text:
-            out.append({"start": start, "text": text})
+            out.append({"start": start, "text": _to_traditional(text)})
     if not out and getattr(r, "text", None):
-        out.append({"start": 0.0, "text": r.text.strip()})
+        out.append({"start": 0.0, "text": _to_traditional(r.text.strip())})
     return out
 
 
@@ -410,7 +423,7 @@ def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> di
   "corrected_transcript": [{{"speaker": "speaker_1", "text": "修正後文字"}}]
 }}
 
-要求：summary 2–4 小節、每節 3–6 要點並標明發言者；action_items 指明負責人；topics 2–4 個標籤。"""
+要求：summary 2–4 小節、每節 3–6 要點並標明發言者；action_items 指明負責人；topics 2–4 個標籤；corrected_transcript 的 text 欄位必須使用繁體中文並加上正確標點符號。"""
 
     resp = client.chat.completions.create(
         model=CHAT_MODEL,
