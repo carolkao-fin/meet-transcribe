@@ -1,6 +1,6 @@
 # 🎙 MeetTranscribe
 
-> 免費 AI 會議轉錄與分析工具｜Groq Whisper + Llama 3.3 + Streamlit
+> 免費 AI 會議轉錄與分析工具｜Groq Whisper + GPT-OSS + Streamlit
 
 上傳音訊或即時錄音 → 自動轉錄逐字稿 → 指定發言者 → AI 生成會議摘要、行動項目與主題標籤，全程使用 Groq 免費方案，一個 API Key 搞定所有功能。
 
@@ -26,7 +26,7 @@
 
 ### 即時口譯（「即時錄音／口譯」分頁）
 
-演講、研討會現場用：聽講者說話，Groq Llama 依場景即時翻譯，畫面上原文與譯文並排。
+演講、研討會現場用：聽講者說話，Groq 語言模型依場景即時翻譯，畫面上原文與譯文並排。
 
 | 功能 | 說明 |
 |------|------|
@@ -46,7 +46,7 @@
 - 可直接編輯文字內容（修正術語、公司名稱等）
 - 時間軸時間碼顯示於每段旁邊
 
-### AI 分析（Groq Llama 3.3 70B）
+### AI 分析（Groq GPT-OSS 120B）
 
 分析結果包含四個部分：
 
@@ -134,7 +134,7 @@ streamlit run app.py
 | 項目 | 說明 |
 |------|------|
 | 轉錄模型 | `whisper-large-v3`（Groq 託管） |
-| 分析模型 | `llama-3.3-70b-versatile`（Groq 託管） |
+| 分析／翻譯模型 | `openai/gpt-oss-120b`，備援 `qwen/qwen3.8-27b`、`openai/gpt-oss-20b`（Groq 託管；模型下架時自動改用可用的） |
 | 前端框架 | Streamlit 1.31+ |
 | 音訊處理 | ffmpeg / ffprobe |
 | 中文轉換 | opencc-python-reimplemented（簡體→繁體，s2twp） |

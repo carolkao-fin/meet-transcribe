@@ -1,7 +1,7 @@
 """
 MeetTranscribe — Streamlit 版（使用 Groq，完全免費）
-上傳音檔（最大 100 MB）→ Groq Whisper 轉錄 → 指定發言者 → Groq Llama 分析
-即時口譯：瀏覽器語音辨識 → Groq Llama 依場景與簡報翻譯 → 原文／譯文對照下載
+上傳音檔（最大 100 MB）→ Groq Whisper 轉錄 → 指定發言者 → Groq 語言模型分析
+即時口譯：瀏覽器語音辨識 → Groq 語言模型依場景與簡報翻譯 → 原文／譯文對照下載
 """
 
 import base64
@@ -11,6 +11,7 @@ import html
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -260,7 +261,11 @@ MIN_CHUNK_SEC   = 1.0
 GROQ_AUDIO_EXTS = {
     ".flac", ".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".ogg", ".opus", ".wav", ".webm",
 }
-CHAT_MODEL    = "llama-3.3-70b-versatile"
+# Groq 會不定期下架模型（llama-3.3-70b-versatile、llama-3.1-8b-instant 已於 2026-08-16 停用），
+# 所以不寫死單一模型：依序嘗試下列清單，並先向 Groq 查詢這把 Key 目前能用哪些。
+CHAT_MODELS = ["openai/gpt-oss-120b", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]   # 品質優先
+FAST_MODELS = ["openai/gpt-oss-20b", "qwen/qwen3.8-27b", "openai/gpt-oss-120b"]   # 速度優先
+_NOT_CHAT   = ("whisper", "guard", "orpheus", "tts", "embed", "safeguard")
 
 # Groq 免費方案 TPM 上限 ~12,000 tokens；
 # prompt 固定部分約 500 tokens，max_tokens=2048，故逐字稿最多保留 ~9,000 tokens。
@@ -268,6 +273,68 @@ CHAT_MODEL    = "llama-3.3-70b-versatile"
 MAX_TRANSCRIPT_CHARS = 12_000
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+def _available_models(groq_key: str) -> set[str] | None:
+    """這把 Key 目前能用的模型（每個連線只查一次）；查不到時回傳 None。"""
+    cache = st.session_state.setdefault("_groq_models", {})
+    tag = hashlib.md5(groq_key.encode("utf-8")).hexdigest()
+    if tag not in cache:
+        try:
+            from groq import Groq
+            listing = Groq(api_key=groq_key, max_retries=0, timeout=10.0).models.list()
+            cache[tag] = {m.id for m in listing.data}
+        except Exception:
+            return None                       # 不快取失敗結果，下次再試
+    return cache[tag]
+
+
+def _model_order(groq_key: str, prefs: list[str]) -> list[str]:
+    avail = _available_models(groq_key)
+    if not avail:
+        return list(prefs)
+    order = [m for m in prefs if m in avail]
+    if not order:                             # 清單上的都下架了：改用 Groq 目前有的聊天模型
+        order = sorted(m for m in avail if not any(x in m.lower() for x in _NOT_CHAT))[:3]
+    return order or list(prefs)
+
+
+def groq_chat(groq_key: str, system: str, user: str, max_tokens: int = 1000,
+              json_mode: bool = False, fast: bool = False, temperature: float = 0.2) -> str:
+    """呼叫 Groq 聊天模型；額度用完或模型下架時自動換下一個。"""
+    from groq import Groq
+    client = Groq(api_key=groq_key, max_retries=0, timeout=40.0)
+    blocked = st.session_state.setdefault("_live_blocked", {})
+    models = _model_order(groq_key, FAST_MODELS if fast else CHAT_MODELS)
+    now = time.time()
+    order = [m for m in models if blocked.get(m, 0) < now] or models
+    last_err: Exception | None = None
+    for m in order:
+        kw = dict(
+            model=m,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        if json_mode:
+            kw["response_format"] = {"type": "json_object"}
+        extra = {"reasoning_effort": "low"} if "gpt-oss" in m else {}   # 推理模型：少想一點，回得快
+        for attempt in ({**kw, **extra}, kw) if extra else (kw,):
+            try:
+                r = client.chat.completions.create(**attempt)
+                text = r.choices[0].message.content or ""
+                return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "reasoning" in msg and attempt is not kw:
+                    continue                                   # 這個模型不吃推理參數：拿掉再試一次
+                if "429" in msg or "rate_limit" in msg:
+                    blocked[m] = now + 90                      # 額度暫時用完：休息 90 秒
+                elif "404" in msg or "does not exist" in msg or "decommissioned" in msg:
+                    blocked[m] = now + 86_400                  # 模型已下架：這次連線不再嘗試
+                break
+    raise last_err if last_err else RuntimeError("沒有可用的模型")
+
+
 def secs_hms(s: float) -> str:
     s = int(s)
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
@@ -482,22 +549,22 @@ def transcribe_audio(data: bytes, filename: str, groq_key: str, lc: str | None) 
 
 
 def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> dict:
-    from groq import Groq
-    client = Groq(api_key=groq_key)
-
     txt      = "\n".join(f"{e['speaker']}: {e['text']}" for e in transcript)
     has_zh   = any("\u4e00" <= c <= "\u9fff" for e in transcript for c in e["text"])
     out_lang = "繁體中文" if has_zh else "English"
 
-    # ── 超長逐字稿截斷（保留前 2/3、後 1/3，避免 TPM 超限）──────────────────
-    truncated = False
-    if len(txt) > MAX_TRANSCRIPT_CHARS:
-        keep_head = int(MAX_TRANSCRIPT_CHARS * 0.67)
-        keep_tail = MAX_TRANSCRIPT_CHARS - keep_head
-        txt = txt[:keep_head] + f"\n\n… [逐字稿過長，中間部分已略去] …\n\n" + txt[-keep_tail:]
-        truncated = True
+    full_txt = txt
+    last_err: Exception | None = None
+    # Groq 免費方案每分鐘 token 有上限；太長就保留前 2/3、後 1/3，還是太長就再縮
+    for cap in (MAX_TRANSCRIPT_CHARS, 7_000, 4_000):
+        txt, truncated = full_txt, False
+        if len(txt) > cap:
+            keep_head = int(cap * 0.67)
+            keep_tail = cap - keep_head
+            txt = txt[:keep_head] + "\n\n… [逐字稿過長，中間部分已略去] …\n\n" + txt[-keep_tail:]
+            truncated = True
 
-    prompt = f"""你是一個專業的會議記錄分析師。請分析以下會議逐字稿，並以 {out_lang} 輸出結構化的分析結果。{"（注意：逐字稿因過長已截取首尾，請根據現有內容盡力分析。）" if truncated else ""}
+        prompt = f"""你是一個專業的會議記錄分析師。請分析以下會議逐字稿，並以 {out_lang} 輸出結構化的分析結果。{"（注意：逐字稿因過長已截取首尾，請根據現有內容盡力分析。）" if truncated else ""}
 
 會議資訊：
 - 標題：{meeting_info.get("title", "未命名會議")}
@@ -532,18 +599,20 @@ def analyze_with_groq(transcript: list, meeting_info: dict, groq_key: str) -> di
 
 要求：summary 2–4 小節、每節 3–6 要點並標明發言者；action_items 指明負責人；topics 2–4 個標籤；corrected_transcript 的 text 欄位必須使用繁體中文並加上正確標點符號。"""
 
-    resp = client.chat.completions.create(
-        model=CHAT_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=2048,
-        temperature=0.3,
-    )
-    text = resp.choices[0].message.content.strip()
-    if "```json" in text:
-        text = text.split("```json")[1].split("```")[0].strip()
-    elif text.startswith("```"):
-        text = text.split("```")[1].split("```")[0].strip()
-    return json.loads(text)
+        try:
+            text = groq_chat(groq_key, "你是專業的會議記錄分析師，只輸出 JSON。", prompt,
+                             max_tokens=4096, json_mode=True, temperature=0.3)
+        except Exception as e:
+            last_err = e
+            if ("413" in str(e) or "too large" in str(e).lower()) and len(full_txt) > 4_000:
+                continue                       # 太長：縮短後再試
+            raise
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif text.startswith("```"):
+            text = text.split("```")[1].split("```")[0].strip()
+        return json.loads(text)
+    raise last_err if last_err else RuntimeError("分析失敗")
 
 
 def save_to_history(transcript, analysis, meeting_info, record_id=None,
@@ -662,7 +731,7 @@ def render_results(data: dict, info: dict, transcript: list, key_prefix: str = "
 
 # ── 即時口譯 ───────────────────────────────────────────────────────────────────
 # 語音 → 文字（自動偵測：Groq Whisper；指定語言：瀏覽器語音辨識）
-# → Groq Llama 依場景、簡報、名詞對照表翻譯 → 原文／譯文對照
+# → Groq 語言模型依場景、簡報、名詞對照表翻譯 → 原文／譯文對照
 TAIPEI = timezone(timedelta(hours=8))
 
 LIVE_AUTO = "自動偵測（任何語言，一句講完才出字）"
@@ -690,53 +759,23 @@ LIVE_TARGETS = {
     "한국어": "자연스럽고 간결한 구어체 한국어",
     "简体中文": "自然、简洁的口语简体中文",
 }
-# 主力模型用完免費額度時，自動改用後面的輕量模型，字幕不中斷
-LIVE_MODELS         = [CHAT_MODEL, "llama-3.1-8b-instant"]
 LIVE_WHISPER_MODELS = ["whisper-large-v3-turbo", WHISPER_MODEL]
-LIVE_CONTEXT_PAIRS  = 4       # 翻譯時帶入的前文段數
+LIVE_CONTEXT_PAIRS  = 3       # 翻譯時帶入的前文段數
 LIVE_LEARN_EVERY    = 6       # 每累積幾段重新判斷場景、學一次新名詞
 LIVE_SLIDE_CHARS    = 9_000   # 送去整理的簡報文字上限（Groq 免費方案 TPM 限制）
-LIVE_GLOSSARY_MAX   = 60      # 每次翻譯最多帶入的對照表行數（另加本句出現的名詞）
+LIVE_GLOSSARY_MAX   = 25      # 每次翻譯最多帶入的對照表組數（另加本句出現的名詞）
 
 live_mic = components.declare_component(
     "live_mic", path=str(Path(__file__).parent / "live_mic")
 )
 
 
-def _live_chat(groq_key: str, system: str, user: str, max_tokens: int = 500,
-               json_mode: bool = False, models: list[str] | None = None) -> str:
-    """呼叫 Groq 聊天模型；遇到額度或模型問題時依序換下一個模型。"""
-    from groq import Groq
-    client = Groq(api_key=groq_key, max_retries=0, timeout=25.0)
-    blocked = st.session_state.setdefault("_live_blocked", {})
-    now = time.time()
-    models = models or LIVE_MODELS
-    order = [m for m in models if blocked.get(m, 0) < now] or models
-    last_err: Exception | None = None
-    for m in order:
-        try:
-            kw = dict(
-                model=m,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": user}],
-                max_tokens=max_tokens,
-                temperature=0.2,
-            )
-            if json_mode:
-                kw["response_format"] = {"type": "json_object"}
-            r = client.chat.completions.create(**kw)
-            return (r.choices[0].message.content or "").strip()
-        except Exception as e:
-            last_err = e
-            if "429" in str(e) or "rate_limit" in str(e):
-                blocked[m] = now + 90      # 這個模型先休息 90 秒
-    raise last_err if last_err else RuntimeError("沒有可用的模型")
-
-
 def _live_error(e: Exception) -> str:
     msg = str(e)
     if "401" in msg or "invalid_api_key" in msg.lower():
         return "Groq API Key 無效"
+    if "404" in msg or "does not exist" in msg or "decommissioned" in msg:
+        return "Groq 模型已下架，請回報給管理者更新模型清單"
     if "429" in msg or "rate_limit" in msg:
         return "Groq 免費額度暫時用完，稍後按「重譯失敗段落」"
     if "timed out" in msg.lower() or "timeout" in msg.lower():
@@ -941,7 +980,12 @@ def _live_system_prompt(raw: str, detected: str = "") -> str:
     if scene:
         parts.append(f"【場景】\n{scene}")
     if ss.live_slide_ctx:
-        parts.append(f"【簡報內容與專有名詞】\n{ss.live_slide_ctx}")
+        low = raw.lower()
+        topic = [ln for ln in ss.live_slide_ctx.splitlines() if ln.strip().startswith("主題")][:1]
+        terms = _parse_pairs(ss.live_slide_ctx)
+        hit = [t for t in terms if t[0].lower() in low or t[1].lower() in low]
+        terms = hit + [t for t in terms if t not in hit][:15]
+        parts.append("【簡報內容與專有名詞】\n" + "\n".join(topic + [f"{a}={b}" for a, b in terms]))
     glossary = _glossary_for_prompt(raw)
     if glossary:
         parts.append(f"【專有名詞對照表】（左右兩邊是同一個詞的兩種語言，務必依此翻譯）\n{glossary}")
@@ -955,8 +999,8 @@ def _live_system_prompt(raw: str, detected: str = "") -> str:
 def _live_translate(groq_key: str, raw: str, detected: str = "") -> tuple[str, str, bool]:
     """回傳（修正後原文, 譯文, 是否成功）。"""
     try:
-        out = _live_chat(groq_key, _live_system_prompt(raw, detected), raw,
-                         max_tokens=600, json_mode=True)
+        out = groq_chat(groq_key, _live_system_prompt(raw, detected), raw,
+                        max_tokens=1000, json_mode=True)
     except Exception as e:
         return raw, f"（翻譯失敗：{_live_error(e)}）", False
     try:
@@ -987,7 +1031,7 @@ def _live_draft(groq_key: str, text: str) -> str:
     if hits:
         system += "\n名詞對照：" + "、".join(hits)
     try:
-        out = _live_chat(groq_key, system, text, max_tokens=300, models=LIVE_MODELS[1:] or LIVE_MODELS)
+        out = groq_chat(groq_key, system, text, max_tokens=500, fast=True)
     except Exception:
         return ""
     return " ".join(out.split())
@@ -1064,7 +1108,7 @@ def _live_learn(groq_key: str) -> None:
         return
     known = "、".join(str(r.get("原文", "")) for r in _gloss_rows()[-80:] if r.get("原文")) or "（無）"
     try:
-        out = _live_chat(
+        out = groq_chat(
             groq_key,
             "你負責幫現場口譯整理筆記。根據最近的原文與譯文，只輸出一個 JSON 物件：\n"
             '{"scene": "40 字以內：這是什麼場合、什麼領域、在談什麼主題", '
@@ -1075,7 +1119,7 @@ def _live_learn(groq_key: str) -> None:
             "「已有名詞」裡的不要重複；沒有就給空陣列。",
             "已有名詞：" + known + "\n\n最近內容：\n"
             + "\n".join(f"原文：{e['src']}\n譯文：{e['tgt']}" for e in recent),
-            max_tokens=500, json_mode=True,
+            max_tokens=1200, json_mode=True,
         )
         obj = json.loads(out)
     except Exception:
@@ -1135,14 +1179,14 @@ def _live_load_slides(groq_key: str, data: bytes, filename: str) -> None:
         note += f" 內容較長，每頁只取前 {per} 字來整理名詞。"
     body = "\n".join(f"[{i+1}] {p}" for i, p in enumerate(pages))[:LIVE_SLIDE_CHARS + 2_000]
     tgt_name = "中文（原文是中文時則用英文）" if ss.live_target == LIVE_BIDI else ss.live_target
-    ss.live_slide_ctx = _live_chat(
+    ss.live_slide_ctx = groq_chat(
         groq_key,
         "你負責幫現場口譯做事前準備。根據簡報文字輸出：\n"
         "第一行「主題：」用 40 字以內說明場合、領域與主題。\n"
         "接著「名詞：」列出最多 40 個演講中可能出現的專有名詞、人名、公司名、產品名、縮寫，"
         f"一行一個，格式「原文=譯名」（譯名用{tgt_name}；沒有通行譯名就保留原文）。\n"
         "只根據簡報內容，不要編造，不要其他說明。",
-        body, max_tokens=900,
+        body, max_tokens=2000,
     )
     ss.live_slide_note = note
 
@@ -1472,7 +1516,7 @@ with st.sidebar:
 st.markdown(f"""
 <div class="hero">
   <h1>🎙 MeetTranscribe</h1>
-  <p>上傳音訊 · Groq Whisper 免費轉錄 · 指定發言者 · Llama AI 免費分析 · 一個 Key 搞定所有功能</p>
+  <p>上傳音訊 · Groq Whisper 免費轉錄 · 指定發言者 · AI 免費分析 · 一個 Key 搞定所有功能</p>
   <p class="hero-link">📖 第一次使用？請看
     <a href="{MANUAL_URL}" target="_blank" rel="noopener">操作手冊</a>
     ——申請 Groq API Key → 音檔轉逐字稿 → AI 整理成會議紀錄</p>
@@ -1730,7 +1774,7 @@ if st.session_state.transcript:
                     f"⚠️ 逐字稿共 {len(full_txt):,} 字元，超過 Groq 免費方案上限（{MAX_TRANSCRIPT_CHARS:,} 字元）。"
                     " 系統將自動保留首尾最重要的片段進行分析。如需完整分析，請升級至 Groq Dev Tier。"
                 )
-            with st.spinner("Llama 分析中，請稍候…"):
+            with st.spinner("AI 分析中，請稍候…"):
                 try:
                     info = {
                         "title":        meeting_title,

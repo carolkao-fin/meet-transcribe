@@ -79,7 +79,7 @@
       dataType: "json"
     });
   }
-  // 每 2.5 秒把講到一半的句子送去翻草稿（太密會超過 Groq 免費方案每分鐘 30 次的上限）
+  // 每 3 秒把講到一半的句子送去翻草稿（太密會超過 Groq 免費方案每分鐘 30 次的上限）
   setInterval(function () {
     if (!active || mode !== "speech") return;
     if (interimNow && interimNow !== interimSent && interimNow.length >= 6) sendPending();
@@ -88,7 +88,7 @@
       interimSince = 0;
       try { rec.stop(); } catch (err) {}
     }
-  }, 2500);
+  }, 3000);
   function showInterim(text) {
     if (text) { interimEl.textContent = text; interimEl.classList.remove("empty"); }
     else {
