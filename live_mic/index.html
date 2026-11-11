@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <style>
-  :root { --fg:#1f2430; --bg:#ffffff; --muted:#6b7280; --line:#d9dde5; --accent:#c2410c; --soft:#f4f5f8; }
+  :root { --fg:#1f2430; --muted:#6b7280; --line:#d9dde5; --accent:#1BA8A8; --soft:#f4f5f8; }
   * { box-sizing: border-box; }
   body { margin:0; font-family: "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; color:var(--fg); background:transparent; }
   .wrap { display:flex; gap:14px; align-items:stretch; padding:2px; }
@@ -23,6 +23,8 @@
   .status { font-size:12px; color:var(--muted); letter-spacing:.04em; }
   .interim { margin-top:6px; font-size:17px; line-height:1.5; overflow-wrap:anywhere; }
   .interim.empty { color:var(--muted); }
+  .meter { margin-top:8px; height:4px; border-radius:2px; background:var(--soft); overflow:hidden; }
+  .meter > i { display:block; height:100%; width:0; background:var(--accent); transition:width .1s linear; }
   .queue { margin-top:6px; font-size:12px; color:var(--muted); }
   @media (max-width:480px) { .wrap { flex-direction:column; } button#mic { flex-direction:row; } }
 </style>
@@ -32,23 +34,29 @@
   <button id="mic" type="button"><span class="dot"></span><span id="micLabel">開始聆聽</span></button>
   <div class="live">
     <div class="status" id="status">尚未開始</div>
-    <div class="interim empty" id="interim">按下「開始聆聽」後，講者說的話會即時顯示在這裡。</div>
+    <div class="interim empty" id="interim">按下「開始聆聽」後開始即時翻譯。</div>
+    <div class="meter" id="meter" hidden><i id="level"></i></div>
     <div class="queue" id="queue"></div>
   </div>
 </div>
 <script>
 (function () {
   var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
   var micBtn = document.getElementById("mic");
   var micLabel = document.getElementById("micLabel");
   var statusEl = document.getElementById("status");
   var interimEl = document.getElementById("interim");
   var queueEl = document.getElementById("queue");
+  var meterEl = document.getElementById("meter");
+  var levelEl = document.getElementById("level");
 
-  var rec = null, active = false, lang = "en-US";
-  var pending = [];            // 已辨識完成、尚未被 Python 確認收到的段落
+  var mode = "whisper";        // "whisper"：錄一小段送伺服器辨識（自動偵測語言）；"speech"：瀏覽器語音辨識
+  var lang = "auto";
+  var active = false;
+  var pending = [];            // 已完成、尚未被 Python 確認收到的段落（文字或錄音）
   var nextId = Date.now();     // 遞增 id，重新載入後仍然比舊的大
-  var IDLE_HINT = "按下「開始聆聽」後，講者說的話會即時顯示在這裡。";
+  var IDLE_HINT = "按下「開始聆聽」後開始即時翻譯。";
 
   function post(type, data) {
     window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
@@ -64,22 +72,32 @@
   }
   function showInterim(text) {
     if (text) { interimEl.textContent = text; interimEl.classList.remove("empty"); }
-    else { interimEl.textContent = active ? "聆聽中……" : IDLE_HINT; interimEl.classList.add("empty"); }
+    else {
+      interimEl.textContent = !active ? IDLE_HINT
+        : (mode === "whisper" ? "聆聽中……每講完一小段就會送出辨識與翻譯。" : "聆聽中……");
+      interimEl.classList.add("empty");
+    }
     fitHeight();
   }
   function showQueue() {
-    queueEl.textContent = pending.length ? "翻譯中：" + pending.length + " 段" : "";
+    queueEl.textContent = pending.length ? "辨識／翻譯中：" + pending.length + " 段" : "";
     fitHeight();
+  }
+  function label() {
+    return mode === "whisper" ? "聆聽中（自動偵測語言）" : "聆聽中（" + lang + "）";
   }
   function setActive(on, note) {
     active = on;
     micBtn.classList.toggle("on", on);
     micLabel.textContent = on ? "停止聆聽" : "開始聆聽";
-    statusEl.textContent = note || (on ? "聆聽中（" + lang + "）" : "已停止");
+    statusEl.textContent = note || (on ? label() : "已停止");
+    meterEl.hidden = !(on && mode === "whisper");
     showInterim("");
   }
 
-  function build() {
+  /* ───────── 模式一：瀏覽器語音辨識（指定語言，字會邊講邊出現） ───────── */
+  var rec = null;
+  function buildSpeech() {
     var r = new SR();
     r.lang = lang;
     r.continuous = true;
@@ -107,28 +125,139 @@
       } else if (e.error === "audio-capture") {
         setActive(false, "找不到麥克風，請確認裝置已接上。");
       } else if (e.error === "language-not-supported") {
-        setActive(false, "瀏覽器不支援這個辨識語言，請在左側改選其他語言。");
+        setActive(false, "瀏覽器不支援這個辨識語言，請改選其他語言或「自動偵測」。");
       }
       // no-speech / aborted / network：交給 onend 自動重新啟動
     };
     r.onend = function () {
-      if (active) setTimeout(start, 250);   // 瀏覽器會在靜音或約一分鐘後自動停止，這裡接續
+      if (active && mode === "speech") setTimeout(startSpeech, 250);   // 瀏覽器會自動停，這裡接續
     };
     return r;
   }
-  function start() {
-    if (!active) return;
-    try { rec = build(); rec.start(); }
-    catch (err) { setTimeout(start, 600); }
+  function startSpeech() {
+    if (!active || mode !== "speech") return;
+    try { rec = buildSpeech(); rec.start(); }
+    catch (err) { setTimeout(startSpeech, 600); }
   }
-  function stop() {
+  function stopSpeech() {
     var r = rec; rec = null;
     if (r) { r.onend = null; try { r.stop(); } catch (err) {} }
   }
 
+  /* ───────── 模式二：錄一小段 → 送伺服器（Whisper 自動偵測語言） ───────── */
+  var MIN_MS = 2500;      // 一段至少這麼長才在停頓處切
+  var MAX_MS = 12000;     // 講不停時最長多久強制切一段
+  var PAUSE_MS = 650;     // 停頓多久算一句講完
+  var MIN_VOICE_MS = 350; // 一段裡至少要有這麼多人聲才送出，避免把靜音送去辨識
+  var stream = null, audioCtx = null, analyser = null, buf = null, timer = null;
+  var mr = null, parts = [], chunkStart = 0, voiceMs = 0, lastVoice = 0, noise = 0.004, lastTick = 0;
+  var mime = "";
+
+  function pickMime() {
+    var c = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+    for (var i = 0; i < c.length; i++) if (MediaRecorder.isTypeSupported(c[i])) return c[i];
+    return "";
+  }
+  function beginChunk() {
+    parts = []; voiceMs = 0; chunkStart = performance.now(); lastVoice = 0;
+    mr = mime ? new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 32000 }) : new MediaRecorder(stream);
+    var mine = mr;
+    mine.ondataavailable = function (e) { if (e.data && e.data.size) parts.push(e.data); };
+    mine.onstop = function () {
+      var keep = mine._keep, blob = new Blob(parts, { type: mine.mimeType || mime });
+      if (active && mode === "whisper") beginChunk();          // 馬上接著錄下一段，不漏字
+      if (!keep || blob.size < 1500) return;
+      var fr = new FileReader();
+      fr.onload = function () {
+        var b64 = String(fr.result).split(",")[1] || "";
+        if (!b64) return;
+        pending.push({ id: ++nextId, audio: b64, mime: blob.type });
+        sendPending();
+        showQueue();
+      };
+      fr.readAsDataURL(blob);
+    };
+    mine.start();
+  }
+  function endChunk(keep) {
+    if (mr && mr.state !== "inactive") { mr._keep = keep; try { mr.stop(); } catch (err) {} }
+  }
+  function tick() {
+    if (!analyser) return;
+    var now = performance.now(), dt = lastTick ? now - lastTick : 100; lastTick = now;
+    analyser.getFloatTimeDomainData(buf);
+    var sum = 0;
+    for (var i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+    var rms = Math.sqrt(sum / buf.length);
+    var threshold = Math.max(0.012, noise * 3);
+    if (rms > threshold) { voiceMs += dt; lastVoice = now; }
+    else { noise = noise * 0.95 + rms * 0.05; }               // 慢慢學環境底噪
+    levelEl.style.width = Math.min(100, Math.round(rms * 600)) + "%";
+
+    var elapsed = now - chunkStart;
+    var spoke = voiceMs >= MIN_VOICE_MS;
+    var paused = lastVoice && (now - lastVoice) >= PAUSE_MS;
+    if (spoke && elapsed >= MIN_MS && paused) endChunk(true);
+    else if (elapsed >= MAX_MS) endChunk(spoke);
+    else if (!spoke && elapsed >= 4000 && !lastVoice) endChunk(false);   // 一直沒人講話：丟掉重錄
+  }
+  function startRecorder() {
+    navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 }
+    }).then(function (s) {
+      if (!active || mode !== "whisper") { s.getTracks().forEach(function (t) { t.stop(); }); return; }
+      stream = s;
+      var AC = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new AC();
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048;
+      buf = new Float32Array(analyser.fftSize);
+      audioCtx.createMediaStreamSource(stream).connect(analyser);
+      mime = pickMime();
+      lastTick = 0;
+      beginChunk();
+      timer = setInterval(tick, 100);
+    }).catch(function (err) {
+      var denied = err && (err.name === "NotAllowedError" || err.name === "SecurityError");
+      setActive(false, denied
+        ? "麥克風被封鎖。請在網址列左側允許此網站使用麥克風，再按一次開始。"
+        : "無法使用麥克風，請確認裝置已接上。");
+    });
+  }
+  function stopRecorder() {
+    if (timer) { clearInterval(timer); timer = null; }
+    endChunk(voiceMs >= MIN_VOICE_MS);                         // 停止時把最後半句也送出
+    var s = stream, c = audioCtx;
+    stream = null; audioCtx = null; analyser = null;
+    setTimeout(function () {
+      if (s) s.getTracks().forEach(function (t) { t.stop(); });
+      if (c) { try { c.close(); } catch (err) {} }
+    }, 300);
+    levelEl.style.width = "0";
+  }
+
+  /* ───────── 共用 ───────── */
+  function supported() { return mode === "whisper" ? canRecord : !!SR; }
+  function start() { if (mode === "whisper") startRecorder(); else startSpeech(); }
+  function stop()  { stopRecorder(); stopSpeech(); }
+  function refreshSupport() {
+    var ok = supported();
+    micBtn.disabled = !ok;
+    if (!ok) {
+      statusEl.textContent = mode === "whisper" ? "此瀏覽器無法錄音" : "此瀏覽器不支援語音辨識";
+      interimEl.textContent = mode === "whisper"
+        ? "請改用電腦版 Chrome 或 Edge 開啟；或用下方的文字輸入框貼上內容翻譯。"
+        : "請改用電腦版 Chrome 或 Edge，或把講者語言改成「自動偵測」；也可以用下方的文字輸入框。";
+      fitHeight();
+    } else if (!active) {
+      statusEl.textContent = "尚未開始";
+      showInterim("");
+    }
+  }
+
   micBtn.addEventListener("click", function () {
-    if (!SR) return;
-    if (active) { setActive(false); stop(); }
+    if (!supported()) return;
+    if (active) { stop(); setActive(false); }
     else { setActive(true); start(); }
   });
 
@@ -136,9 +265,14 @@
     var d = event.data;
     if (!d || d.type !== "streamlit:render") return;
     var args = d.args || {};
-    if (args.lang && args.lang !== lang) {
-      lang = args.lang;
-      if (active) { stop(); statusEl.textContent = "聆聽中（" + lang + "）"; start(); }
+    var newMode = args.mode === "speech" ? "speech" : "whisper";
+    var newLang = args.lang || lang;
+    if (newMode !== mode || newLang !== lang) {
+      var wasActive = active;
+      if (wasActive) stop();
+      mode = newMode; lang = newLang;
+      if (wasActive && supported()) { setActive(true); setTimeout(start, 350); }
+      else { if (wasActive) setActive(false); refreshSupport(); }
     }
     if (typeof args.acked === "number") {
       pending = pending.filter(function (s) { return s.id > args.acked; });
@@ -156,11 +290,7 @@
     fitHeight();
   });
 
-  if (!SR) {
-    micBtn.disabled = true;
-    statusEl.textContent = "此瀏覽器不支援語音辨識";
-    interimEl.textContent = "請改用電腦版 Chrome 或 Edge 開啟；或用下方的文字輸入框貼上內容翻譯。";
-  }
+  refreshSupport();
   post("streamlit:componentReady", { apiVersion: 1 });
   fitHeight();
 })();
