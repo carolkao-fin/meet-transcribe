@@ -64,12 +64,31 @@
   function fitHeight() {
     post("streamlit:setFrameHeight", { height: document.documentElement.scrollHeight + 4 });
   }
+  var interimNow = "";         // 還在講、尚未定稿的那一句
+  var interimSent = "";        // 上次送去翻草稿的內容
+  var interimSeq = 0;
+  var interimSince = 0;        // 這一句從什麼時候開始講的
   function sendPending() {
+    interimSent = interimNow;
     post("streamlit:setComponentValue", {
-      value: { segments: pending.slice(), last: pending.length ? pending[pending.length - 1].id : 0 },
+      value: {
+        segments: pending.slice(),
+        interim: interimNow ? { seq: ++interimSeq, text: interimNow } : null,
+        last: pending.length ? pending[pending.length - 1].id : 0
+      },
       dataType: "json"
     });
   }
+  // 每 2.5 秒把講到一半的句子送去翻草稿（太密會超過 Groq 免費方案每分鐘 30 次的上限）
+  setInterval(function () {
+    if (!active || mode !== "speech") return;
+    if (interimNow && interimNow !== interimSent && interimNow.length >= 6) sendPending();
+    // 講者一直不停頓時，瀏覽器遲遲不會定稿：超過 10 秒就主動切一句
+    if (interimNow && interimSince && Date.now() - interimSince > 10000 && rec) {
+      interimSince = 0;
+      try { rec.stop(); } catch (err) {}
+    }
+  }, 2500);
   function showInterim(text) {
     if (text) { interimEl.textContent = text; interimEl.classList.remove("empty"); }
     else {
@@ -104,20 +123,23 @@
     r.interimResults = true;
     r.maxAlternatives = 1;
     r.onresult = function (e) {
-      var interim = "";
+      var interim = "", gotFinal = false;
       for (var i = e.resultIndex; i < e.results.length; i++) {
         var res = e.results[i];
         var text = (res[0] && res[0].transcript || "").trim();
         if (!text) continue;
         if (res.isFinal) {
           pending.push({ id: ++nextId, text: text });
-          sendPending();
-          showQueue();
+          gotFinal = true;
         } else {
           interim += text + " ";
         }
       }
-      showInterim(interim.trim());
+      interimNow = interim.trim();
+      if (!interimNow) interimSince = 0;
+      else if (!interimSince) interimSince = Date.now();
+      if (gotFinal) { sendPending(); showQueue(); }
+      showInterim(interimNow);
     };
     r.onerror = function (e) {
       if (e.error === "not-allowed" || e.error === "service-not-allowed") {
@@ -142,12 +164,13 @@
   function stopSpeech() {
     var r = rec; rec = null;
     if (r) { r.onend = null; try { r.stop(); } catch (err) {} }
+    if (interimNow || interimSent) { interimNow = ""; interimSince = 0; sendPending(); }   // 清掉草稿
   }
 
   /* ───────── 模式二：錄一小段 → 送伺服器（Whisper 自動偵測語言） ───────── */
-  var MIN_MS = 2500;      // 一段至少這麼長才在停頓處切
-  var MAX_MS = 12000;     // 講不停時最長多久強制切一段
-  var PAUSE_MS = 650;     // 停頓多久算一句講完
+  var MIN_MS = 1500;      // 一段至少這麼長才在停頓處切
+  var MAX_MS = 8000;      // 講不停時最長多久強制切一段
+  var PAUSE_MS = 500;     // 停頓多久算一句講完
   var MIN_VOICE_MS = 350; // 一段裡至少要有這麼多人聲才送出，避免把靜音送去辨識
   var stream = null, audioCtx = null, analyser = null, buf = null, timer = null;
   var mr = null, parts = [], chunkStart = 0, voiceMs = 0, lastVoice = 0, noise = 0.004, lastTick = 0;
