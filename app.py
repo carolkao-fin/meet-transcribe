@@ -1676,7 +1676,8 @@ with tab_hist:
         with col_list:
             for i, rec in enumerate(history):
                 is_active = (st.session_state.hist_idx == i)
-                _kind = "口譯" if rec.get("kind") == "live" else ("" if rec.get("analysis") else "逐字稿")
+                # 口譯紀錄的標題本身已帶「（口譯）」，不再重複標示
+                _kind = "" if (rec.get("kind") == "live" or rec.get("analysis")) else "逐字稿"
                 tag = f' <span style="font-size:.75rem;color:#9ca3af;">（{_kind}）</span>' if _kind else ""
                 st.markdown(
                     f'<div class="hist-card {"active" if is_active else ""}">'

@@ -61,8 +61,13 @@
   function post(type, data) {
     window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
   }
+  var lastHeight = 0;
   function fitHeight() {
-    post("streamlit:setFrameHeight", { height: document.documentElement.scrollHeight + 4 });
+    // 量內容本身的高度（不是整個框的高度，否則每次都會比上次多一點、越撐越高），有變才通知
+    var h = Math.ceil(document.querySelector(".wrap").getBoundingClientRect().height) + 6;
+    if (h === lastHeight) return;
+    lastHeight = h;
+    post("streamlit:setFrameHeight", { height: h });
   }
   var interimNow = "";         // 還在講、尚未定稿的那一句
   var interimSent = "";        // 上次送去翻草稿的內容
