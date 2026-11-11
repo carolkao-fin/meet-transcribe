@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --fg:#1f2430; --bg:#ffffff; --muted:#6b7280; --line:#d9dde5; --accent:#c2410c; --soft:#f4f5f8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Noto Sans TC","Microsoft JhengHei",system-ui,sans-serif; color:var(--fg); background:transparent; }
+  .wrap { display:flex; gap:14px; align-items:stretch; padding:2px; }
+  button#mic {
+    flex:0 0 auto; min-width:132px; border:1px solid var(--line); border-radius:10px;
+    background:var(--soft); color:var(--fg); font:inherit; font-size:15px; font-weight:600;
+    padding:12px 14px; cursor:pointer; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px;
+  }
+  button#mic:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+  button#mic.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button#mic:disabled { opacity:.5; cursor:not-allowed; }
+  .dot { width:12px; height:12px; border-radius:50%; background:var(--muted); }
+  .on .dot { background:#fff; animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity:.25; } }
+  @media (prefers-reduced-motion: reduce) { .on .dot { animation:none; } }
+  .live { flex:1 1 auto; min-width:0; border:1px solid var(--line); border-radius:10px; padding:10px 14px; min-height:92px; }
+  .status { font-size:12px; color:var(--muted); letter-spacing:.04em; }
+  .interim { margin-top:6px; font-size:17px; line-height:1.5; overflow-wrap:anywhere; }
+  .interim.empty { color:var(--muted); }
+  .queue { margin-top:6px; font-size:12px; color:var(--muted); }
+  @media (max-width:480px) { .wrap { flex-direction:column; } button#mic { flex-direction:row; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <button id="mic" type="button"><span class="dot"></span><span id="micLabel">開始聆聽</span></button>
+  <div class="live">
+    <div class="status" id="status">尚未開始</div>
+    <div class="interim empty" id="interim">按下「開始聆聽」後，講者說的話會即時顯示在這裡。</div>
+    <div class="queue" id="queue"></div>
+  </div>
+</div>
+<script>
+(function () {
+  var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  var micBtn = document.getElementById("mic");
+  var micLabel = document.getElementById("micLabel");
+  var statusEl = document.getElementById("status");
+  var interimEl = document.getElementById("interim");
+  var queueEl = document.getElementById("queue");
+
+  var rec = null, active = false, lang = "en-US";
+  var pending = [];            // 已辨識完成、尚未被 Python 確認收到的段落
+  var nextId = Date.now();     // 遞增 id，重新載入後仍然比舊的大
+  var IDLE_HINT = "按下「開始聆聽」後，講者說的話會即時顯示在這裡。";
+
+  function post(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+  }
+  function fitHeight() {
+    post("streamlit:setFrameHeight", { height: document.documentElement.scrollHeight + 4 });
+  }
+  function sendPending() {
+    post("streamlit:setComponentValue", {
+      value: { segments: pending.slice(), last: pending.length ? pending[pending.length - 1].id : 0 },
+      dataType: "json"
+    });
+  }
+  function showInterim(text) {
+    if (text) { interimEl.textContent = text; interimEl.classList.remove("empty"); }
+    else { interimEl.textContent = active ? "聆聽中……" : IDLE_HINT; interimEl.classList.add("empty"); }
+    fitHeight();
+  }
+  function showQueue() {
+    queueEl.textContent = pending.length ? "翻譯中：" + pending.length + " 段" : "";
+    fitHeight();
+  }
+  function setActive(on, note) {
+    active = on;
+    micBtn.classList.toggle("on", on);
+    micLabel.textContent = on ? "停止聆聽" : "開始聆聽";
+    statusEl.textContent = note || (on ? "聆聽中（" + lang + "）" : "已停止");
+    showInterim("");
+  }
+
+  function build() {
+    var r = new SR();
+    r.lang = lang;
+    r.continuous = true;
+    r.interimResults = true;
+    r.maxAlternatives = 1;
+    r.onresult = function (e) {
+      var interim = "";
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        var res = e.results[i];
+        var text = (res[0] && res[0].transcript || "").trim();
+        if (!text) continue;
+        if (res.isFinal) {
+          pending.push({ id: ++nextId, text: text });
+          sendPending();
+          showQueue();
+        } else {
+          interim += text + " ";
+        }
+      }
+      showInterim(interim.trim());
+    };
+    r.onerror = function (e) {
+      if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+        setActive(false, "麥克風被封鎖。請在網址列左側允許此網站使用麥克風，再按一次開始。");
+      } else if (e.error === "audio-capture") {
+        setActive(false, "找不到麥克風，請確認裝置已接上。");
+      } else if (e.error === "language-not-supported") {
+        setActive(false, "瀏覽器不支援這個辨識語言，請在左側改選其他語言。");
+      }
+      // no-speech / aborted / network：交給 onend 自動重新啟動
+    };
+    r.onend = function () {
+      if (active) setTimeout(start, 250);   // 瀏覽器會在靜音或約一分鐘後自動停止，這裡接續
+    };
+    return r;
+  }
+  function start() {
+    if (!active) return;
+    try { rec = build(); rec.start(); }
+    catch (err) { setTimeout(start, 600); }
+  }
+  function stop() {
+    var r = rec; rec = null;
+    if (r) { r.onend = null; try { r.stop(); } catch (err) {} }
+  }
+
+  micBtn.addEventListener("click", function () {
+    if (!SR) return;
+    if (active) { setActive(false); stop(); }
+    else { setActive(true); start(); }
+  });
+
+  window.addEventListener("message", function (event) {
+    var d = event.data;
+    if (!d || d.type !== "streamlit:render") return;
+    var args = d.args || {};
+    if (args.lang && args.lang !== lang) {
+      lang = args.lang;
+      if (active) { stop(); statusEl.textContent = "聆聽中（" + lang + "）"; start(); }
+    }
+    if (typeof args.acked === "number") {
+      pending = pending.filter(function (s) { return s.id > args.acked; });
+      showQueue();
+    }
+    var th = d.theme;
+    if (th) {
+      var st = document.documentElement.style;
+      if (th.textColor) st.setProperty("--fg", th.textColor);
+      if (th.secondaryBackgroundColor) st.setProperty("--soft", th.secondaryBackgroundColor);
+      if (th.primaryColor) st.setProperty("--accent", th.primaryColor);
+      if (th.base === "dark") { st.setProperty("--line", "#3a3f4b"); st.setProperty("--muted", "#9aa3b2"); }
+      else { st.setProperty("--line", "#d9dde5"); st.setProperty("--muted", "#6b7280"); }
+    }
+    fitHeight();
+  });
+
+  if (!SR) {
+    micBtn.disabled = true;
+    statusEl.textContent = "此瀏覽器不支援語音辨識";
+    interimEl.textContent = "請改用電腦版 Chrome 或 Edge 開啟；或用下方的文字輸入框貼上內容翻譯。";
+  }
+  post("streamlit:componentReady", { apiVersion: 1 });
+  fitHeight();
+})();
+</script>
+</body>
+</html>
