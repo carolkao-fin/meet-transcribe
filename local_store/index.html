@@ -1,0 +1,89 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<script>
+/* 把歷史記錄與名詞對照表存在使用者瀏覽器裡（IndexedDB，容量遠大於 localStorage）。
+   載入時把內容回傳給 Python；之後 Python 每次有變動就送來要存的內容。 */
+(function () {
+  var DB = "meetTranscribe", STORE = "kv";
+  var LS_KEYS = { history: "meetTranscribeHistory", glossary: "meetTranscribeGlossary" };
+  var db = null, loaded = false, lastSeq = 0, queued = null;
+
+  function post(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data || {}), "*");
+  }
+  function report(value) {
+    post("streamlit:setComponentValue", { value: value, dataType: "json" });
+  }
+  function openDb() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open(DB, 1);
+      req.onupgradeneeded = function () { req.result.createObjectStore(STORE); };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+      req.onblocked = function () { reject(new Error("blocked")); };
+    });
+  }
+  function idbGet(key) {
+    return new Promise(function (resolve, reject) {
+      var req = db.transaction(STORE, "readonly").objectStore(STORE).get(key);
+      req.onsuccess = function () { resolve(req.result == null ? null : req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }
+  function idbPut(key, value) {
+    return new Promise(function (resolve, reject) {
+      var tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).put(value, key);
+      tx.oncomplete = function () { resolve(); };
+      tx.onerror = tx.onabort = function () { reject(tx.error || new Error("abort")); };
+    });
+  }
+  function lsGet(key) { try { return localStorage.getItem(LS_KEYS[key]); } catch (e) { return null; } }
+
+  async function load() {
+    var out = { ready: true, history: null, glossary: null, error: "" };
+    try { db = await openDb(); } catch (e) { db = null; }
+    for (var key in LS_KEYS) {
+      var v = null;
+      if (db) { try { v = await idbGet(key); } catch (e) { v = null; } }
+      if (v == null) v = lsGet(key);            // 舊版存在 localStorage 的資料，第一次載入時接手
+      out[key] = v;
+    }
+    loaded = true;
+    report(out);
+    if (queued) { var q = queued; queued = null; save(q); }
+  }
+
+  async function save(items) {
+    var failed = [];
+    for (var key in items) {
+      if (!(key in LS_KEYS) || typeof items[key] !== "string") continue;
+      var ok = false;
+      if (db) { try { await idbPut(key, items[key]); ok = true; } catch (e) { ok = false; } }
+      if (!ok) { try { localStorage.setItem(LS_KEYS[key], items[key]); ok = true; } catch (e) { ok = false; } }
+      if (!ok) failed.push(key);
+    }
+    if (failed.length) {
+      report({ ready: true, history: null, glossary: null, error: failed.join(","), at: Date.now() });
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    var d = event.data;
+    if (!d || d.type !== "streamlit:render") return;
+    var args = d.args || {};
+    if (args.save && typeof args.seq === "number" && args.seq > lastSeq) {
+      lastSeq = args.seq;
+      if (loaded) save(args.save); else queued = Object.assign(queued || {}, args.save);
+    }
+  });
+
+  post("streamlit:componentReady", { apiVersion: 1 });
+  post("streamlit:setFrameHeight", { height: 0 });
+  load();
+})();
+</script>
+</body>
+</html>

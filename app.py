@@ -6,6 +6,7 @@ MeetTranscribe — Streamlit 版（使用 Groq，完全免費）
 
 import base64
 import csv
+import hashlib
 import html
 import io
 import json
@@ -27,7 +28,6 @@ except Exception:
 
 import streamlit as st
 import streamlit.components.v1 as components
-from streamlit_javascript import st_javascript
 
 # 圖解操作手冊：申請 Groq API Key → 音檔轉逐字稿 → AI 整理成會議紀錄
 MANUAL_URL = "https://claude.ai/code/artifact/39221198-5e11-4d5f-a739-d30b1cac141f"
@@ -150,28 +150,97 @@ if "meeting_title_key" not in st.session_state:
 if st.session_state.get("_pending_title"):
     st.session_state["meeting_title_key"] = st.session_state.pop("_pending_title")
 
-# ── 從 localStorage 載入歷史記錄（每個 session 只做一次）────────────────────────
-if not st.session_state["_history_loaded"]:
-    _raw = st_javascript('localStorage.getItem("meetTranscribeHistory")')
-    if _raw and _raw != 0 and _raw not in ("null", "undefined"):
+# ── 持續保存：歷史記錄與名詞對照表存在使用者瀏覽器（IndexedDB）────────────────
+# local_store 元件在每次 run 的最後才畫出來；它載入完成後會把內容回傳並觸發 rerun，
+# 下一次 run 的這裡就能讀到。
+local_store = components.declare_component(
+    "local_store", path=str(Path(__file__).parent / "local_store")
+)
+
+
+def _clean_gloss_rows(rows) -> list[dict]:
+    out, seen = [], set()
+    for r in rows if isinstance(rows, list) else []:
+        if not isinstance(r, dict):
+            continue
+        src, tgt = str(r.get("原文") or "").strip(), str(r.get("譯名") or "").strip()
+        if not src or not tgt or src.lower() in seen:
+            continue
+        seen.add(src.lower())
+        out.append({"啟用": bool(r.get("啟用", True)), "原文": src, "譯名": tgt,
+                    "來源": str(r.get("來源") or "手動")})
+    return out
+
+
+def _merge_history(records) -> int:
+    """把載入的紀錄併進目前的歷史（同 id 不重複），回傳新增幾筆。"""
+    have = {r.get("id") for r in st.session_state.history}
+    added = 0
+    for r in records if isinstance(records, list) else []:
+        if (isinstance(r, dict) and r.get("id") and r["id"] not in have
+                and "transcript" in r and "meeting_info" in r):
+            r.setdefault("analysis", None)
+            r.setdefault("title", r["meeting_info"].get("title", "未命名會議"))
+            r.setdefault("date", r["meeting_info"].get("date", ""))
+            r.setdefault("participants", r["meeting_info"].get("participants", []))
+            have.add(r["id"])
+            st.session_state.history.append(r)
+            added += 1
+    if added:
+        st.session_state.history.sort(key=lambda r: str(r.get("id", "")).replace("live_", ""), reverse=True)
+    return added
+
+
+def _merge_glossary(rows) -> int:
+    ss = st.session_state
+    merged = _clean_gloss_rows(list(ss.live_gloss) + _clean_gloss_rows(rows))
+    added = len(merged) - len(_clean_gloss_rows(ss.live_gloss))
+    if added:
+        ss.live_gloss = merged
+        ss.live_gloss_base = [dict(r) for r in merged]
+        ss.live_gloss_ver += 1
+    return added
+
+
+_store_val = st.session_state.get("local_store_val")
+if (not st.session_state["_history_loaded"]
+        and isinstance(_store_val, dict) and _store_val.get("ready") and not _store_val.get("at")):
+    for _key, _merge in (("history", _merge_history), ("glossary", _merge_glossary)):
         try:
-            _loaded = json.loads(_raw)
-            if isinstance(_loaded, list) and _loaded:
-                st.session_state.history = _loaded
+            _merge(json.loads(_store_val.get(_key) or "[]"))
         except Exception:
             pass
-    if _raw != 0:          # 0 表示 JS 還沒執行完，等下次 rerun 再標記
-        st.session_state["_history_loaded"] = True
+    st.session_state["_history_loaded"] = True
 
 
 def _persist_history() -> None:
-    """將目前歷史記錄同步至瀏覽器 localStorage（音訊檔案不存入，避免超過大小限制）。"""
-    slim = [{k: v for k, v in r.items() if k not in ("audio_bytes",)} for r in st.session_state.history]
-    data = json.dumps(slim, ensure_ascii=False)
-    components.html(
-        f'<script>localStorage.setItem("meetTranscribeHistory",{json.dumps(data)});</script>',
-        height=0,
-    )
+    """把歷史記錄與名詞對照表同步到瀏覽器；內容沒變就不重送（音訊檔不存，太大）。"""
+    ss = st.session_state
+    save = {}
+    if ss["_history_loaded"]:              # 載入完成前不能寫，否則會用空的蓋掉舊資料
+        slim = [{k: v for k, v in r.items() if k != "audio_bytes"} for r in ss.history]
+        payloads = {
+            "history": json.dumps(slim, ensure_ascii=False),
+            "glossary": json.dumps(_clean_gloss_rows(ss.live_gloss), ensure_ascii=False),
+        }
+        sent = ss.setdefault("_store_sent", {})
+        for k, v in payloads.items():
+            h = hashlib.md5(v.encode("utf-8")).hexdigest()
+            if sent.get(k) != h:
+                save[k], sent[k] = v, h
+        if save:
+            ss["_store_seq"] = ss.get("_store_seq", 0) + 1
+    local_store(save=save or None, seq=ss.get("_store_seq", 0), key="local_store_val", default=None)
+
+
+def _backup_json() -> str:
+    ss = st.session_state
+    return json.dumps({
+        "app": "MeetTranscribe", "exported": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "history": [{k: v for k, v in r.items() if k != "audio_bytes"} for r in ss.history],
+        "glossary": _clean_gloss_rows(ss.live_gloss),
+    }, ensure_ascii=False, indent=1)
+
 
 # ── 常數 ───────────────────────────────────────────────────────────────────────
 LANG_MAP      = {"自動偵測": None, "中文 (zh)": "zh", "英文 (en)": "en"}
@@ -1467,25 +1536,49 @@ with tab_rec:
 
 # ── Tab 3: History ─────────────────────────────────────────────────────────────
 with tab_hist:
-    st.markdown("**載入過去儲存的 JSON 紀錄**")
-    loaded_file = st.file_uploader("上傳 .json 檔案", type=["json"],
-                                   key="hist_upload", label_visibility="collapsed")
+    if isinstance(_store_val, dict) and _store_val.get("error"):
+        st.warning("⚠️ 瀏覽器無法儲存資料（可能是無痕模式或儲存空間已滿），關閉分頁後紀錄會消失。"
+                   "請先按下方「備份全部紀錄」下載保存。")
+    st.caption("紀錄會自動保存在這台電腦的這個瀏覽器裡，關閉視窗或重新整理後仍在（原始音檔除外）。"
+               "換電腦、換瀏覽器或清除網站資料前，請先下載備份。")
+    c_bk, c_up = st.columns([1, 2])
+    with c_bk:
+        st.download_button(
+            "⬇ 備份全部紀錄 (.json)", _backup_json(),
+            f"MeetTranscribe_備份_{datetime.now():%Y%m%d_%H%M}.json", mime="application/json",
+            key="hist_backup", use_container_width=True,
+            help="包含所有逐字稿、AI 分析、口譯紀錄與名詞對照表。在別台電腦上傳這個檔案即可還原。",
+            disabled=not (st.session_state.history or st.session_state.live_gloss),
+        )
+    with c_up:
+        loaded_file = st.file_uploader("載入備份檔或單筆紀錄 (.json)", type=["json"],
+                                       key="hist_upload", label_visibility="collapsed")
     if loaded_file:
-        try:
-            rec = json.loads(loaded_file.read().decode("utf-8"))
-            if all(k in rec for k in ("transcript", "analysis", "meeting_info")):
-                save_to_history(rec["transcript"], rec["analysis"], rec["meeting_info"])
-                st.success(f"已載入：{rec['meeting_info'].get('title','')}")
-                st.rerun()
-            else:
-                st.error("格式不正確，請上傳由本系統產生的 .json 檔案")
-        except Exception as e:
-            st.error(f"載入失敗：{e}")
+        _sig = f"{loaded_file.name}:{loaded_file.size}"
+        if st.session_state.get("_hist_upload_sig") != _sig:     # 同一個檔案只處理一次
+            st.session_state["_hist_upload_sig"] = _sig
+            try:
+                rec = json.loads(loaded_file.getvalue().decode("utf-8-sig"))
+                if isinstance(rec, dict) and isinstance(rec.get("history"), list):
+                    n_h = _merge_history(rec["history"])
+                    n_g = _merge_glossary(rec.get("glossary", []))
+                    st.session_state["_hist_msg"] = f"已還原 {n_h} 筆紀錄、{n_g} 組名詞（已存在的不重複加入）。"
+                    st.rerun()
+                elif isinstance(rec, dict) and all(k in rec for k in ("transcript", "analysis", "meeting_info")):
+                    save_to_history(rec["transcript"], rec["analysis"], rec["meeting_info"])
+                    st.session_state["_hist_msg"] = f"已載入：{rec['meeting_info'].get('title', '')}"
+                    st.rerun()
+                else:
+                    st.error("格式不正確，請上傳由本系統產生的 .json 檔案")
+            except Exception as e:
+                st.error(f"載入失敗：{e}")
+    if st.session_state.get("_hist_msg"):
+        st.success(st.session_state.pop("_hist_msg"))
 
     st.divider()
     history = st.session_state.history
     if not history:
-        st.info("📭 還沒有歷史紀錄。完成 AI 分析後自動儲存，或上傳 .json 檔案。")
+        st.info("📭 還沒有歷史紀錄。轉錄、AI 分析或即時口譯後會自動儲存，也可以上傳備份檔還原。")
     else:
         st.markdown(f"**共 {len(history)} 筆紀錄**")
         col_list, col_detail = st.columns([1, 2])
@@ -1618,8 +1711,6 @@ if st.session_state.analysis:
         st.session_state.transcript,
     )
 
-# ── 每次 run 結束時將歷史記錄同步至 localStorage ───────────────────────────────
-# 必須等 _history_loaded=True 才能寫入，否則第一次 render JS 尚未執行（回傳 0），
-# history 還是空的，會把 localStorage 的舊資料覆蓋掉。
-if st.session_state["_history_loaded"]:
-    _persist_history()
+# ── 每次 run 結束時把歷史記錄與名詞對照表同步到瀏覽器 ──────────────────────────
+# 這個元件必須每次都畫出來：第一次負責把瀏覽器裡的舊資料讀回來，之後負責寫入。
+_persist_history()
