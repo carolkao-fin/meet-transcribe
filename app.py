@@ -462,13 +462,47 @@ def _transcode_to_mp3(src: str) -> str:
     return out
 
 
+_ZH_LANGS = ("chinese", "zh", "mandarin", "cantonese", "yue")
+
+# Whisper 在靜音／雜音時常「編」出的字幕殘留句（訓練資料裡的字幕）
+_HALLUCINATIONS = (
+    "謝謝收看", "感謝收看", "謝謝觀看", "感謝觀看", "字幕由", "字幕提供", "請訂閱", "订阅", "请不吝点赞",
+    "中文字幕", "시청해 주셔서 감사합니다", "구독과 좋아요", "ご視聴ありがとうございました",
+    "thanks for watching", "thank you for watching", "subtitles by", "amara.org",
+)
+
+
+def _is_zh(lang: str | None) -> bool:
+    return str(lang or "").lower() in _ZH_LANGS
+
+
+def _seg_is_junk(get) -> bool:
+    """判斷 Whisper 的一個 segment 是不是幻覺／非人聲（get 為取值函式）。"""
+    text = str(get("text", "") or "").strip().lower()
+    if not text:
+        return True
+    nsp = float(get("no_speech_prob", 0) or 0)
+    alp = float(get("avg_logprob", 0) or 0)
+    cr  = float(get("compression_ratio", 0) or 0)
+    if nsp > 0.6:                      # 幾乎確定不是人聲
+        return True
+    if nsp > 0.4 and alp < -1.0:       # 可能無聲，而且模型沒信心
+        return True
+    if cr > 2.4:                       # 重複迴圈的典型幻覺
+        return True
+    if len(text) < 60 and any(h in text for h in _HALLUCINATIONS):
+        return True
+    return False
+
+
 def _call_whisper(client, path: str, lc: str | None) -> list[dict]:
     size = os.path.getsize(path)
     if size < MIN_CHUNK_BYTES:
         raise ValueError(
             f"要送出的音訊只有 {size} bytes，內容為空或已損毀，已中止上傳。"
         )
-    _prompt = "請使用繁體中文輸出，並加上正確的標點符號。" if (lc == "zh" or lc is None) else None
+    # 只有明確選中文時才帶中文提示；自動偵測不帶，避免把非中文語音往中文推
+    _prompt = "請使用繁體中文輸出，並加上正確的標點符號。" if lc == "zh" else None
     with open(path, "rb") as fh:
         create_kwargs = dict(
             model=WHISPER_MODEL,
@@ -480,14 +514,17 @@ def _call_whisper(client, path: str, lc: str | None) -> list[dict]:
         if _prompt:
             create_kwargs["prompt"] = _prompt
         r = client.audio.transcriptions.create(**create_kwargs)
+    # 原文是什麼語言就呈現什麼語言：只有 Whisper 判定為中文時才做簡→繁轉換
+    conv = _to_traditional if (lc == "zh" or _is_zh(getattr(r, "language", ""))) else (lambda t: t)
     out = []
     for s in getattr(r, "segments", None) or []:
-        start = float(s["start"] if isinstance(s, dict) else s.start)
-        text  = (s["text"]  if isinstance(s, dict) else getattr(s, "text", "") or "").strip()
-        if text:
-            out.append({"start": start, "text": _to_traditional(text)})
-    if not out and getattr(r, "text", None):
-        out.append({"start": 0.0, "text": _to_traditional(r.text.strip())})
+        get = s.get if isinstance(s, dict) else lambda k, d=None, _s=s: getattr(_s, k, d)
+        if _seg_is_junk(get):
+            continue
+        start = float(get("start", 0) or 0)
+        out.append({"start": start, "text": conv(str(get("text", "")).strip())})
+    if not out and not getattr(r, "segments", None) and getattr(r, "text", None):
+        out.append({"start": 0.0, "text": conv(r.text.strip())})
     return out
 
 
@@ -1080,13 +1117,14 @@ def _live_whisper(groq_key: str, audio_b64: str, mime: str) -> tuple[str, str]:
     kept = []
     for s in getattr(r, "segments", None) or []:
         get = s.get if isinstance(s, dict) else lambda k, d=None, _s=s: getattr(_s, k, d)
-        if float(get("no_speech_prob", 0) or 0) > 0.6:      # 幾乎確定不是人聲
+        if _seg_is_junk(get):                               # 非人聲／幻覺
             continue
         kept.append(str(get("text", "") or "").strip())
     text = " ".join(t for t in kept if t)
     if not kept and not getattr(r, "segments", None):
         text = str(getattr(r, "text", "") or "").strip()
-    if lang.lower() in ("chinese", "zh", "mandarin", "cantonese", "yue"):
+    # 原文是什麼語言就呈現什麼語言；只有中文才轉繁體
+    if _is_zh(lang):
         text = _to_traditional(text)
     return text, lang
 
